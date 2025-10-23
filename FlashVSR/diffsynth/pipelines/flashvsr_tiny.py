@@ -163,6 +163,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         self.use_unified_sequence_parallel = False
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
+        self.long_mode=False
 
 
         print(r"""
