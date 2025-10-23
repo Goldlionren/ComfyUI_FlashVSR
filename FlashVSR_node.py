@@ -4,14 +4,15 @@
 import numpy as np
 import torch
 import os
-from .model_loader_utils import  tensor_upscale,load_images_list
+from .model_loader_utils import  tensor_upscale,load_images_list,get_video_files
 from .FlashVSR.examples.WanVSR.infer_flashvsr_full import init_pipeline,run_inference
 from .FlashVSR.examples.WanVSR.infer_flashvsr_tiny import   init_pipeline_tiny,run_inference_tiny
 import folder_paths
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 import nodes
-
+from pathlib import PureWindowsPath
+from comfy_api.input_impl import VideoFromFile
 
 MAX_SEED = np.iinfo(np.int32).max
 node_cr_path = os.path.dirname(os.path.abspath(__file__))
@@ -105,6 +106,80 @@ class FlashVSR_SM_KSampler(io.ComfyNode):
         images=load_images_list(images)
         return io.NodeOutput(images)
 
+
+class FlashVSR_SM_VideoPathLoop(io.ComfyNode):
+    @classmethod
+    def __init__(cls):
+        cls.counters = {}
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FlashVSR_SM_VideoPathLoop",
+            display_name="FlashVSR_SM_VideoPathLoop",
+            category="FlashVSR",
+            inputs=[
+                io.String.Input("video_dir", multiline=False, default="/video"),
+                io.Int.Input("seed", default=0, min=0, max=MAX_SEED),
+                io.Float.Input("start", default=0.0, min=-18446744073709551615, max=18446744073709551615, step=0.01,),
+                io.Float.Input("stop", default=0.0, min=-18446744073709551615, max=18446744073709551615, step=0.01,),
+                io.Float.Input("step", default=1, min=0,max=99999,step=0.01, ),
+                io.Combo.Input("mode",options= ["increment", "decrement", "increment_to_stop", "decrement_to_stop"],),
+                io.Combo.Input("video_file", options=['none', 'webm', 'mp4', 'mkv', 'gif', 'mov']),
+                io.Custom("NUMBER").Input("reset_bool",optional=True),
+            ],
+            outputs=[
+                io.Video.Output(),
+                io.Custom("NUMBER").Output(display_name="number"),
+                io.Int.Output(display_name="seed"),
+                io.String.Output(display_name="filename"),
+            ],
+        )
+    
+    @classmethod
+    def execute(cls, video_dir,seed, mode, start, stop, step,video_file,reset_bool=0,**kwargs) -> io.NodeOutput:
+        video_path = PureWindowsPath(video_dir).as_posix() if video_dir else None
+        video_file = None if video_file == 'none' else video_file
+        assert video_path is not None, "video_dir is not set"
+        UNIQUE_ID = os.path.normpath(video_path) 
+        counter =start
+        if cls.counters.__contains__(UNIQUE_ID):
+            counter = cls.counters[UNIQUE_ID]
+        if round(reset_bool) >= 1:
+            counter = start
+
+        if mode == 'increment':
+            counter += step
+        elif mode == 'decrement':
+            counter -= step
+        elif mode == 'increment_to_stop':
+            counter = counter + step if counter < stop else counter
+        elif mode == 'decrement_to_stop':
+            counter = counter - step if counter > stop else counter
+
+        cls.counters[UNIQUE_ID] = counter
+        result = int(counter)
+
+        
+        video_list = get_video_files(video_path, video_file)
+        rows = len(video_list) if video_list else 0
+        if rows == 0:
+            assert False, "no video found"
+
+        if result == 0:
+            selected_path = video_list[0]
+        else:
+            adjusted_index = (result - 1) % rows
+            selected_path = video_list[adjusted_index]
+            
+        print(f"Selected video path: {selected_path}")
+        filename=os.path.basename(selected_path)
+        return io.NodeOutput(VideoFromFile(selected_path),result, seed,filename)
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs):
+       return ""
+
+
 from aiohttp import web
 from server import PromptServer
 @PromptServer.instance.routes.get("/FlashVSR_SM_Extension")
@@ -117,6 +192,7 @@ class FlashVSR_SM_Extension(ComfyExtension):
         return [
             FlashVSR_SM_Model,
             FlashVSR_SM_KSampler,
+            FlashVSR_SM_VideoPathLoop,
         ]
 async def comfy_entrypoint() -> FlashVSR_SM_Extension:  # ComfyUI calls this to load your extension and its nodes.
     return FlashVSR_SM_Extension()
