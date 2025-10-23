@@ -276,39 +276,41 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
     torch.cuda.empty_cache()
     #torch.Size([1, 16, 20, 48, 80])
     tiler_kwargs = {"tiled": tiled, "tile_size": (60, 104), "tile_stride": (30, 52)}
-    try:
-        frames = pipe.decode_video(frames, **tiler_kwargs)
-    except:
-        pipe.vae.to('cpu')
-        torch.cuda.empty_cache()   
-        pipe.vae.to('cuda')
-        total_frames = frames.shape[2]
-        segment_size = (split_num-1) * 2 // 4 # 40
-        decoded_frames_list = []
-        for start_idx in range(0, total_frames, segment_size):
-            end_idx = min(start_idx + segment_size, total_frames)
-            frames_segment = frames[:, :, start_idx:end_idx, :, :]          
-            decoded_segment = pipe.decode_video(frames_segment, **tiler_kwargs)
-            decoded_frames_list.append(decoded_segment)
-        frames = torch.cat(decoded_frames_list, dim=2)  
-    try:
-        if color_fix:
-            if pad_first_frame:
-                frames = dup_first_frame_1cthw_simple(frames)
-                LQ_video=dup_first_frame_1cthw_simple(LQ_video)
-            frames = pipe.ColorCorrector(
-                frames.to(device=device),
-                LQ[:, :, :frames.shape[2], :, :],
-                clip_range=(-1, 1),
-                chunk_size=16,
-                method=fix_method
-            )
-            if pad_first_frame:
-                frames = frames[:, :, 1:, :, :] # remove first frame
-    except:
-        pass
-    print("Done.")
-    pipe.vae.to('cpu')  
+    with torch.no_grad():
+        try:
+            frames = pipe.decode_video(frames, **tiler_kwargs)
+        except:
+            print("vae decode_video OOM.try split latent" )
+            pipe.vae.to('cpu')
+            torch.cuda.empty_cache()   
+            pipe.vae.to('cuda')
+            total_frames = frames.shape[2]
+            segment_size = (split_num-1) * 2 // 4 # 40
+            decoded_frames_list = []
+            for start_idx in range(0, total_frames, segment_size):
+                end_idx = min(start_idx + segment_size, total_frames)
+                frames_segment = frames[:, :, start_idx:end_idx, :, :]          
+                decoded_segment = pipe.decode_video(frames_segment, **tiler_kwargs)
+                decoded_frames_list.append(decoded_segment)
+            frames = torch.cat(decoded_frames_list, dim=2)  
+        try:
+            if color_fix:
+                if pad_first_frame:
+                    frames = dup_first_frame_1cthw_simple(frames)
+                    LQ_video=dup_first_frame_1cthw_simple(LQ_video)
+                frames = pipe.ColorCorrector(
+                    frames.to(device=device),
+                    LQ[:, :, :frames.shape[2], :, :],
+                    clip_range=(-1, 1),
+                    chunk_size=16,
+                    method=fix_method
+                )
+                if pad_first_frame:
+                    frames = frames[:, :, 1:, :, :] # remove first frame
+        except:
+            pass
+        print("Done.")
+        pipe.vae.to('cpu')  
     del LQ
     torch.cuda.empty_cache()    
     frames = tensor2video(frames[0])   

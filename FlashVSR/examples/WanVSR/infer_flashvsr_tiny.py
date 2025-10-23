@@ -267,46 +267,47 @@ def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,c
     pipe.dit.to('cpu')  
     torch.cuda.empty_cache()   
     #print(LQ.shape,frames.shape,LQ_cur_idx)#torch.Size([1, 3, 81, 384, 640]) torch.Size([1, 16, 20, 48, 80]) 77
-    try:
-        frames = pipe.TCDecoder.decode_video(frames.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
-    except:
-        print("TCDecoder decode_video OOM.")
-        pipe.TCDecoder.to('cpu')
-        torch.cuda.empty_cache()   
-        pipe.TCDecoder.to('cuda')
-        frames = frames.transpose(1, 2)  # 转换为 [B, T, C, H, W] 格式
-        cond_frames = LQ[:,:,:LQ_cur_idx,:,:]
-        segment_size = (split_num-1) * 2  # 160
-        latent_segment_size = segment_size // 4 # 40
-        decoded_frames_list = []
-        total_latent_frames = frames.shape[1]
-        for start_idx in range(0, total_latent_frames, latent_segment_size):
-            end_idx = min(start_idx + latent_segment_size, total_latent_frames)
+    with torch.no_grad():
+        try:
+            frames = pipe.TCDecoder.decode_video(frames.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+        except:
+            print("TCDecoder decode_video OOM.try split latent" )
+            pipe.TCDecoder.to('cpu')
+            torch.cuda.empty_cache()   
+            pipe.TCDecoder.to('cuda')
+            frames = frames.transpose(1, 2)  # 转换为 [B, T, C, H, W] 格式
+            cond_frames = LQ[:,:,:LQ_cur_idx,:,:]
+            segment_size = (split_num-1) * 2  # 160
+            latent_segment_size = segment_size // 4 # 40
+            decoded_frames_list = []
+            total_latent_frames = frames.shape[1]
+            for start_idx in range(0, total_latent_frames, latent_segment_size):
+                end_idx = min(start_idx + latent_segment_size, total_latent_frames)
+                
+                # 潜在空间的切片
+                frames_segment = frames[:, start_idx:end_idx, :, :, :]
+                
+                # 对应的条件帧（在原始空间中）
+                start_cond_idx = start_idx * 4
+                end_cond_idx = min(end_idx * 4 , LQ_cur_idx)
+                cond_segment = cond_frames[:, :, start_cond_idx:end_cond_idx, :, :]
+                
+                decoded_segment = pipe.TCDecoder.decode_video(
+                    frames_segment,
+                    parallel=False,
+                    show_progress_bar=False,
+                    cond=cond_segment
+                )
+                decoded_frames_list.append(decoded_segment)
             
-            # 潜在空间的切片
-            frames_segment = frames[:, start_idx:end_idx, :, :, :]
-            
-            # 对应的条件帧（在原始空间中）
-            start_cond_idx = start_idx * 4
-            end_cond_idx = min(end_idx * 4 , LQ_cur_idx)
-            cond_segment = cond_frames[:, :, start_cond_idx:end_cond_idx, :, :]
-            
-            decoded_segment = pipe.TCDecoder.decode_video(
-                frames_segment,
-                parallel=False,
-                show_progress_bar=False,
-                cond=cond_segment
-            )
-            decoded_frames_list.append(decoded_segment)
-        
-        decoded_frames = torch.cat(decoded_frames_list, dim=1)  # 
-        frames = decoded_frames.transpose(1, 2).mul_(2).sub_(1)
+            decoded_frames = torch.cat(decoded_frames_list, dim=1)  # 
+            frames = decoded_frames.transpose(1, 2).mul_(2).sub_(1)
         
     # 颜色校正（wavelet）
     # shape: 1,16, 20, 64, 96
     try:
         if color_fix:
-            if pad_first_frame:
+            if pad_first_frame: # 加帧
                 frames = dup_first_frame_1cthw_simple(frames)
                 LQ=dup_first_frame_1cthw_simple(LQ)
             frames = pipe.ColorCorrector(
@@ -316,7 +317,7 @@ def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,c
                 chunk_size=16,
                 method=fix_method
                 )
-            if pad_first_frame:
+            if pad_first_frame: #减帧
                 frames = frames[:, :, 1:, :, :] # remove first frame
     except:
         pass
