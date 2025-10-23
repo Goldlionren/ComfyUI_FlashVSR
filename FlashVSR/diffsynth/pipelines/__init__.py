@@ -14,6 +14,6 @@ from .step_video import StepVideoPipeline
 from .wan_video import WanVideoPipeline
 from .flashvsr_full import FlashVSRFullPipeline
 from .flashvsr_tiny import FlashVSRTinyPipeline
-
+from .flashvsr_tiny_long import FlashVSRTinyLongPipeline
 # from .wan_video_swin import WanVideoSwinPipeline
 KolorsImagePipeline = SDXLImagePipeline
