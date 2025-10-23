@@ -2,6 +2,7 @@
 [FlashVSR](https://github.com/OpenImagingLab/FlashVSR): Towards Real-Time Diffusion-Based Streaming Video Super-Resolution,this node ,you can use it in comfyUI
 
 # Upadte
+*  新增切片视频路径加载节点，输入保存切片视频的路径，开启自动推理，即可推理完路径所有视频； 
 *  修复输入图像归一化处理错误导致无法复现官方的问题，分离decoder，新增关键点模型卸载和OOM处理，包括处理超长视频向量的OOM，同步官方local range的修改，新增小波模式下的加减帧处理（项目一作大佬提的）；
 *  local_range=7这个是会最清晰，local_range=11会比较稳定，color fix 推荐用小波（没重影）； 
 *  编译Block-Sparse-Attention  window的轮子 可以使用 [ smthemex 强制编译版](https://github.com/smthemex/Block-Sparse-Attention) 或者 [lihaoyun6 要联网](https://github.com/lihaoyun6/Block-Sparse-Attention) 两个fork来，不推荐用官方的  
@@ -58,6 +59,8 @@ python setup.py install
 ![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example18.png)
 * tiny new
 ![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example1022.png)
+* video files loop
+![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example.png)
 
 # Acknowledgements
 [DiffSynth Studio](https://github.com/modelscope/DiffSynth-Studio)  
