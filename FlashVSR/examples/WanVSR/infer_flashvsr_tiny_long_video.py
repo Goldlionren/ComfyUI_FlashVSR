@@ -266,7 +266,7 @@ def run_inference_tiny_long(pipe,input,seed,scale,kv_ratio=3.0,local_range=11,st
             fix_method=fix_method,
         )
     print("Done.")
-    pipe.TCDecoder.to('cpu')
+    pipe.to('cpu')
     del LQ
     torch.cuda.empty_cache()   
     frames = tensor2video(frames) 
