@@ -301,7 +301,7 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
             if color_fix:
                 if pad_first_frame:
                     frames = dup_first_frame_1cthw_simple(frames)
-                    LQ_video=dup_first_frame_1cthw_simple(LQ_video)
+                    LQ=dup_first_frame_1cthw_simple(LQ)
                 frames = pipe.ColorCorrector(
                     frames.to(device=device),
                     LQ[:, :, :frames.shape[2], :, :],
