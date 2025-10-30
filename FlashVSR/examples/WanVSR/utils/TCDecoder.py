@@ -280,8 +280,8 @@ class TAEW2_1DiffusersWrapper(nn.Module):
     def __init__(self, pretrained_path=None, channels = [256, 128, 64, 64]):
         super().__init__()
         self.dtype = torch.bfloat16
-        self.device = "cuda"
-        self.taehv = TAEHV(pretrained_path, channels = channels).to(self.dtype)
+        self.device = "xpu"
+        self.taehv = TAEHV(pretrained_path, channels = channels).to(self.device).to(self.dtype)
         self.temperal_downsample = [True, True, False]  # [sic]
         self.config = DotDict(scaling_factor=1.0, latents_mean=torch.zeros(16), z_dim=16, latents_std=torch.ones(16))
 
@@ -301,7 +301,7 @@ class TAEW2_1DiffusersWrapper(nn.Module):
 # ----------------------------
 
 def build_tcdecoder(new_channels = [512, 256, 128, 128],
-                                  device="cuda",
+                                  device="xpu",
                                   dtype=torch.bfloat16,
                                   new_latent_channels=None):
     """

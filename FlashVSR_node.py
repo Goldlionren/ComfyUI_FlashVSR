@@ -19,7 +19,7 @@ MAX_SEED = np.iinfo(np.int32).max
 node_cr_path = os.path.dirname(os.path.abspath(__file__))
 
 device = torch.device(
-    "cuda:0") if torch.cuda.is_available() else torch.device(
+    "xpu:0") if torch.xpu.is_available() else torch.device(
     "mps") if torch.backends.mps.is_available() else torch.device(
     "cpu")
 
@@ -45,14 +45,13 @@ class FlashVSR_SM_Model(io.ComfyNode):
                 io.Combo.Input("vae",options= ["none"] + folder_paths.get_filename_list("vae") ),
                 io.Combo.Input("tcd_encoder",options= ["none"] + [i for i in folder_paths.get_filename_list("FlashVSR") if "tcd" in i.lower()] ),
                 io.Boolean.Input("tiny_long", default=False),
-                io.Combo.Input("decode_vae",options= ["none"] + folder_paths.get_filename_list("vae") ),
             ],
             outputs=[
                 io.Custom("FlashVSR_SM_Model").Output(),
                 ],
             )
     @classmethod
-    def execute(cls, dit,proj_pt,emb_pt,vae,tcd_encoder,tiny_long,decode_vae) -> io.NodeOutput:
+    def execute(cls, dit,proj_pt,emb_pt,vae,tcd_encoder,tiny_long) -> io.NodeOutput:
         dit_path=folder_paths.get_full_path("FlashVSR", dit) if dit != "none" else None
         proj_pt_path=folder_paths.get_full_path("FlashVSR", proj_pt) if proj_pt != "none" else None
         vae_path=folder_paths.get_full_path("vae", vae) if vae != "none" else None
@@ -63,12 +62,11 @@ class FlashVSR_SM_Model(io.ComfyNode):
         assert vae_path is not None or tcd_encoder_path is not None , "Please select the Sdit,proj_pt,checkpoint file"
         if tcd_encoder_path is not None:
             if tiny_long:
-                model=init_pipeline_long(prompt_path,proj_pt_path,dit_path, tcd_encoder_path, device="cuda")
+                model=init_pipeline_long(prompt_path,proj_pt_path,dit_path, tcd_encoder_path, device="xpu")
             else:
-                model=init_pipeline_tiny(prompt_path,proj_pt_path,dit_path, tcd_encoder_path, device="cuda")
+                model=init_pipeline_tiny(prompt_path,proj_pt_path,dit_path, tcd_encoder_path, device="xpu")
         elif vae_path is not None :
-            decode_vae=folder_paths.get_full_path("vae", decode_vae) if decode_vae != "none" else "none"
-            model=init_pipeline(prompt_path,proj_pt_path,dit_path, vae_path,decode_vae,node_cr_path ,device="cuda")
+            model=init_pipeline(prompt_path,proj_pt_path,dit_path, vae_path, device="xpu")
         else:
             raise Exception("Please select the vae or tcd_encoder")
         return io.NodeOutput(model)

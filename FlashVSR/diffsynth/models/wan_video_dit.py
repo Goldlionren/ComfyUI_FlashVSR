@@ -160,7 +160,8 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
 
 
 @torch.no_grad()
-def generate_causal_block_mask(batch_size, nheads, seqlen, local_num, window_size, device='cuda', train_img=False):
+def generate_causal_block_mask(batch_size, nheads, seqlen, local_num, window_size, device=None, train_img=False):
+    device = device or torch.device('cpu')
     i = torch.arange(seqlen, device=device).view(-1, 1)
     j = torch.arange(seqlen, device=device).view(1, -1)
     causal_mask = (j <= i) & (j >= i - local_num + 1)
@@ -247,33 +248,49 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
 
 
 def sinusoidal_embedding_1d(dim, position):
-    sinusoid = torch.outer(position.type(torch.float64), torch.pow(
-        10000, -torch.arange(dim//2, dtype=torch.float64, device=position.device).div(dim//2)))
-    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    pos_f32 = position.to(torch.float32)
+    # arange 用 float32；保持 device 与 position 一致
+    inv_freq = torch.pow(
+        torch.tensor(10000.0, device=pos_f32.device, dtype=torch.float32),
+        -torch.arange(dim // 2, device=pos_f32.device, dtype=torch.float32) / (dim // 2)
+    )
+    sinusoid = torch.outer(pos_f32, inv_freq)  # [len, dim//2]，float32
+    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)  # float32
     return x.to(position.dtype)
 
 
 def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
-    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta)
-    h_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
-    w_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
+    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta)  # complex64
+    h_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)              # complex64
+    w_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)              # complex64
     return f_freqs_cis, h_freqs_cis, w_freqs_cis
 
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
-                   [: (dim // 2)].double() / dim))
-    freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+#    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
+#                   [: (dim // 2)].double() / dim))
+#    freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
+#    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+#    return freqs_cis
+    # 全程 float32，避免生成 double
+    base = torch.arange(0, dim, 2, dtype=torch.float32)
+    base = base[: (dim // 2)]
+    freqs = 1.0 / (theta ** (base / dim))                         # [dim//2], float32
+    t = torch.arange(end, dtype=torch.float32, device=freqs.device)  # [end], float32
+    freqs = torch.outer(t, freqs)                                  # [end, dim//2], float32
+    # 生成 complex64（原来隐式是 complex128），更适配 XPU
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
     return freqs_cis
-
 
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(
-        x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
+    # 以 float32 + complex64 实现，避免 FP64 需求
+    x_fp32 = x.to(torch.float32).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
+    x_c = torch.view_as_complex(x_fp32)                        # complex64
+    # freqs 已在 precompute 阶段 to(complex64)
+    y_c = x_c * freqs                                         # complex64
+    y = torch.view_as_real(y_c).flatten(2)                    # 回到实数，两列堆回
+    return y.to(x.dtype)
 
 
 # ----------------------------

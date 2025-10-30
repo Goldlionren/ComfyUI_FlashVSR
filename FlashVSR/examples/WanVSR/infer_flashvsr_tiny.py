@@ -56,7 +56,7 @@ def largest_8n1_leq(n):  # 8n+1
 def is_video(path):
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
 
-def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='cuda'):
+def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='xpu'):
     t = torch.from_numpy(np.asarray(img, np.uint8)).to(device=device, dtype=torch.float32)  # HWC
     t = t.permute(2,0,1) / 255.0 * 2.0 - 1.0                                              # CHW in [-1,1]
     return t.to(dtype=dtype)
@@ -121,7 +121,7 @@ def tensor2pillist(tensor_in):
         img_list=[tensor2image(i) for i in tensor_list]
     return img_list
 
-def prepare_input_tensor(path: str, scale: float = 4,fps=30, dtype=torch.bfloat16, device='cuda'):
+def prepare_input_tensor(path: str, scale: float = 4,fps=30, dtype=torch.bfloat16, device='xpu'):
 
     if isinstance(path,torch.Tensor):
         total,h0,w0,_ = path.shape
@@ -142,7 +142,7 @@ def prepare_input_tensor(path: str, scale: float = 4,fps=30, dtype=torch.bfloat1
             img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
             frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))
         frames = torch.stack(frames, 0).permute(1,0,2,3).unsqueeze(0)  # 1 C F H W  
-        torch.cuda.empty_cache()
+        torch.xpu.empty_cache()
         return frames, tH, tW, F, fps
         
     elif os.path.isdir(path):
@@ -232,7 +232,7 @@ def prepare_input_tensor(path: str, scale: float = 4,fps=30, dtype=torch.bfloat1
         raise ValueError(f"Unsupported input: {path}")
    
 
-def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",TCDecoder_path="./FlashVSR/TCDecoder.ckpt",device="cuda"):
+def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",TCDecoder_path="./FlashVSR/TCDecoder.ckpt",device="xpu"):
 
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     mm.load_models([ckpt_path,])
@@ -245,31 +245,69 @@ def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt
     
     multi_scale_channels = [512, 256, 128, 128]
     pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
-    mis = pipe.TCDecoder.load_state_dict(torch.load(TCDecoder_path,weights_only=False,), strict=False)
+
+# 用 CPU 读权重，再加载到模块；避免 CUDA 反序列化分支被触发
+    state = torch.load(TCDecoder_path, map_location='cpu', weights_only=True)
+    mis = pipe.TCDecoder.load_state_dict(state, strict=False)
+# 统一把模块放到 XPU + BF16，并进入推理模式
+    #pipe.TCDecoder = pipe.TCDecoder.to('xpu').to(torch.bfloat16).train()
+    pipe.TCDecoder = pipe.TCDecoder.to(device="xpu", dtype=torch.bfloat16).eval()
+    # 如果 pipeline 里有去噪/主模型，也一并切到 XPU + BF16
+    if hasattr(pipe, "denoising_model") and callable(pipe.denoising_model):
+        try:
+            pipe.denoising_model().to(device="xpu", dtype=torch.bfloat16).eval()
+        except Exception:
+            pass
+#（可选）给 pipeline 标注默认 device/dtype，避免后面新建张量落到 CPU/FP32
+    setattr(pipe, "device", torch.device("xpu"))
+    setattr(pipe, "dtype", torch.bfloat16)
+
     print(mis)
 
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
-    pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
+    pipe.init_cross_kv(prompt_path)
+    pipe.load_models_to_device(["dit","vae"])   # 若内部会覆盖到 cuda，后面再强制 to(xpu,bf16)
+# 保险起见，再统一一遍
+    try:
+        pipe.denoising_model().to(device="xpu", dtype=torch.bfloat16).eval()
+    except Exception:
+        pass
+    pipe.TCDecoder = pipe.TCDecoder.to(device="xpu", dtype=torch.bfloat16).eval()
+
     return pipe
 
-def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
-    pipe.to('cuda')
+def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="xpu", save_vodeo_=False,):
+    pipe.to('xpu')
 
     pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
 
-    torch.cuda.empty_cache(); torch.cuda.ipc_collect()
+#    torch.xpu.empty_cache(); torch.xpu.ipc_collect()
+    import gc
+    torch.xpu.empty_cache()
+    if hasattr(torch.xpu, "ipc_collect"):
+        torch.xpu.ipc_collect()
+    else:
+        if hasattr(torch.xpu, "synchronize"):
+            torch.xpu.synchronize()
+        gc.collect()
+
 
     LQ, th, tw, F, fps = prepare_input_tensor(input, scale=scale,dtype=dtype, device=device)
-    frames,LQ_cur_idx = pipe(
-        prompt="", negative_prompt="", cfg_scale=cfg_scale, num_inference_steps=step, seed=seed,
-        LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-        topk_ratio=sparse_ratio*768*1280/(th*tw), 
-        kv_ratio=kv_ratio,
-        local_range=local_range,  # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
-        color_fix = color_fix,
-    )
+    # ✅ 用 AMP(bf16) + inference_mode 包裹 pipeline 调用，显著省显存
+    with torch.inference_mode():
+        with torch.autocast(device_type="xpu", dtype=dtype):
+            frames, LQ_cur_idx = pipe(
+                prompt="", negative_prompt="", cfg_scale=cfg_scale,
+                num_inference_steps=step, seed=seed,
+                LQ_video=LQ, num_frames=F, height=th, width=tw,
+                is_full_block=False, if_buffer=True,
+                topk_ratio=sparse_ratio*768*1280/(th*tw),
+                kv_ratio=kv_ratio, local_range=local_range,
+                color_fix=color_fix,
+            )
+    torch.xpu.empty_cache()
     pipe.dit.to('cpu')  
-    torch.cuda.empty_cache()   
+    torch.xpu.empty_cache()   
     #print(LQ.shape,frames.shape,LQ_cur_idx)#torch.Size([1, 3, 81, 384, 640]) torch.Size([1, 16, 20, 48, 80]) 77
     with torch.no_grad():
         try:
@@ -277,8 +315,8 @@ def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,c
         except:
             print("TCDecoder decode_video OOM.try split latent" )
             pipe.TCDecoder.to('cpu')
-            torch.cuda.empty_cache()   
-            pipe.TCDecoder.to('cuda')
+            torch.xpu.empty_cache()   
+            pipe.TCDecoder.to('xpu')
             frames = frames.transpose(1, 2)  # 转换为 [B, T, C, H, W] 格式
             cond_frames = LQ[:,:,:LQ_cur_idx,:,:]
             segment_size = (split_num-1) * 2  # 160
@@ -328,7 +366,7 @@ def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,c
     print("Done.")
     pipe.TCDecoder.to('cpu')
     del LQ
-    torch.cuda.empty_cache()   
+    torch.xpu.empty_cache()   
     frames = tensor2video(frames[0]) 
     if save_vodeo_:
         save_video(frames, os.path.join(folder_paths.get_output_directory(),f"FlashVSR_Full_seed{seed}.mp4"), fps=fps, quality=6)

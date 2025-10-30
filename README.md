@@ -2,10 +2,6 @@
 [FlashVSR](https://github.com/OpenImagingLab/FlashVSR): Towards Real-Time Diffusion-Based Streaming Video Super-Resolution,this node ,you can use it in comfyUI
 
 # Upadte
-* add full mode [lightx2v vae encoder](https://huggingface.co/lightx2v/Autoencoders/tree/main) support（only lightvaew2_1.pth  32.2M now） and [Wan2.1-VAE-upscale2x](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x) support    
-* 新增lightx2v 加速vae decoder支持和Wan2.1-VAE-upscale2x 放大decoder支持，只是在full 模式下有效，light的加速模型目前只支持（lightvaew2_1.pth  #32.2M） 这个文件，如有需要，我再加吧  
-
-# Tips
 *  满足部分网友需要超分单张图片的奇怪要求,默认输出25帧1秒的视频，详见示例，Block-Sparse-Attention 目前不支持5090的sm120架构，需要改一下Block-Sparse-Attention的源码来支持； 
 *  同步tiny的专属long模式  
 *  新增切片视频路径加载节点，输入保存切片视频的路径，开启自动推理，即可推理完路径所有视频； 
@@ -48,7 +44,6 @@ python setup.py install
 
 * 3.1 [FlashVSR](https://huggingface.co/JunhaoZhuang/FlashVSR/tree/main)   all checkpoints 所有模型，vae 用常规的wan2.1  
 * 3.2 emb  [posi_prompt.pth](https://github.com/OpenImagingLab/FlashVSR/tree/main/examples/WanVSR/prompt_tensor)  4M而已
-* 3.3 [lightvaew2_1.pth](https://huggingface.co/lightx2v/Autoencoders/tree/main) and [diffusion_pytorch_model.safetensors](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x/tree/main/diffusers/Wan2.1_VAE_upscale2x_imageonly_real_v1)
   
 ```
 ├── ComfyUI/models/FlashVSR
@@ -58,14 +53,10 @@ python setup.py install
 |     ├── posi_prompt.pth
 ├── ComfyUI/models/vae
 |        ├──Wan2.1_VAE.pth
-|        ├──lightvaew2_1.pth  #32.2M
-|        ├──Wan2.1_VAE_upscale2x_imageonly_real_v1_diff.safetensors  # rename from diffusion_pytorch_model.safetensors
 ```
   
 
 # Example
-* upscale2x and ligth lightvaew2_1.pth
-![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example_decoder.png)
 * single image VSR 
 ![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example_s.png)
 * full old node 
@@ -92,15 +83,6 @@ python setup.py install
       url={https://arxiv.org/abs/2510.12747}, 
 }
 
-```
-lightx2v
-```
-@misc{lightx2v,
- author = {LightX2V Contributors},
- title = {LightX2V: Light Video Generation Inference Framework},
- year = {2025},
- publisher = {GitHub},
- journal = {GitHub repository},
- howpublished = {\url{https://github.com/ModelTC/lightx2v}},
-}
-```
+``
+
+``

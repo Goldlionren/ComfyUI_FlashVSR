@@ -7,79 +7,182 @@ from tqdm import tqdm
 import time
 import math
 
+def safe_cpu_interpolate(tensor: torch.Tensor, out_hw: tuple[int, int]) -> torch.Tensor:
+    """
+    低显存插值：把张量搬到 CPU 用 float32 做插值，再搬回原 device，
+    并在需要时降精度为 bf16/原 dtype。
+    """
+    dev = tensor.device
+    orig_dtype = tensor.dtype
+    # 插值在 CPU 上用 FP32，避免 XPU 大中间张量
+    t_cpu = tensor.to('cpu', dtype=torch.float32, non_blocking=False)
+    out_cpu = F.interpolate(t_cpu, size=out_hw, mode='nearest')  # 与原代码一致：nearest
+    # 回到原 device，优先 bf16（更省显存）
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        return out_cpu.to(dev, dtype=torch.bfloat16, non_blocking=False)
+    else:
+        return out_cpu.to(dev, dtype=orig_dtype, non_blocking=False)
+    
+# ---------- 新增：分片插值，进一步压低峰值 ----------
+def chunked_interpolate(tensor: torch.Tensor, out_hw: tuple[int, int], tile_w: int = 512) -> torch.Tensor:
+    """
+    在 CPU/FP32 上沿宽度方向分片做最近邻插值，避免一次性巨幅放大导致 OOM。
+    期望张量形状 [B, H, Hq, Hk]（最后两维是需要插值的 2D）。
+    """
+    dev = tensor.device
+    orig_dtype = tensor.dtype
+    tgt_h, tgt_w = out_hw
+
+    t_cpu = tensor.to('cpu', dtype=torch.float32, non_blocking=False)
+    b, heads, h, w = t_cpu.shape
+    out_cpu = torch.empty((b, heads, tgt_h, tgt_w), dtype=torch.float32, device='cpu')
+
+    for start in range(0, tgt_w, tile_w):
+        end = min(start + tile_w, tgt_w)
+        # 近似反推源宽度切片（nearest 足够）
+        src_start = int(start * w / tgt_w)
+        src_end = max(src_start + 1, int(end * w / tgt_w))
+        src_slice = t_cpu[:, :, :, src_start:src_end]
+        up_slice = F.interpolate(src_slice, size=(tgt_h, end - start), mode='nearest')
+        out_cpu[:, :, :, start:end] = up_slice
+
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        return out_cpu.to(dev, dtype=torch.bfloat16, non_blocking=False)
+    else:
+        return out_cpu.to(dev, dtype=orig_dtype, non_blocking=False)
+    
+def _sdpa_striped(q, k, v, attn_mask, dropout_p, is_causal, stripe_q=128):
+    """
+    q,k,v: [B,H,Sq,D] / [B,H,Sk,D]
+    attn_mask: None 或 [B,H,mask_h,mask_w]，mask_h/w 可以与 Sq/Sk 不同
+    逐条带计算 SDPA，降低显存峰值
+    """
+    B, H, Sq, D = q.shape
+    Sk = k.shape[2]
+    out_chunks = []
+    # 预取 CPU 侧的掩码以避免重复 .cpu()
+    mask_cpu = None
+    if attn_mask is not None:
+        mask_cpu = attn_mask.detach().to('cpu', dtype=torch.float32, non_blocking=False)
+
+    for qs in range(0, Sq, stripe_q):
+        qe = min(qs + stripe_q, Sq)
+        q_s = q[:, :, qs:qe, :]  # [B,H,qs,D]
+
+        attn_mask_s = None
+        if mask_cpu is not None:
+            # 仅把本条带的掩码高度插值到 (qe-qs)，宽度插到 Sk，都在 CPU/FP32 做
+            mh, mw = mask_cpu.shape[-2:]
+            if (mh != (qe - qs)) or (mw != Sk):
+                m_slice_cpu = F.interpolate(
+                    mask_cpu, size=(qe - qs, Sk), mode='nearest'
+                )
+            else:
+                # 高度正好匹配整段，则直接切条带（快很多）
+                m_slice_cpu = mask_cpu[..., qs:qe, :]
+
+            # 搬回 XPU，并对齐 dtype
+            attn_mask_s = m_slice_cpu.to(q_s.device, dtype=q_s.dtype, non_blocking=False)
+
+        # 核心：每次只计算一条带，减小 B*H*Sq*Sk 的中间张量
+        out_s = F.scaled_dot_product_attention(
+            q_s, k, v, attn_mask=attn_mask_s, dropout_p=0.0, is_causal=is_causal
+        )
+        out_chunks.append(out_s)
+
+        # 主动释放条带中间量，压低峰值
+        del q_s, attn_mask_s, out_s
+        if hasattr(torch.xpu, "synchronize"):
+            torch.xpu.synchronize()
+        torch.xpu.empty_cache()
+
+    # 拼回完整输出
+    return torch.cat(out_chunks, dim=2)  # [B,H,Sq,D]
+
+
 CACHE_T = 2
 
 def block_sparse_attn_func(q, k, v, cu_seqlens_q, cu_seqlens_k, head_mask_type,
                           streaming_info, base_blockmask, max_seqlen_q_, max_seqlen_k_,
                           p_dropout, deterministic=False, softmax_scale=None,
-                          is_causal=False, exact_streaming=False, return_attn_probs=False):
+                          is_causal=False, exact_streaming=False, return_attn_probs=False,
+                          stripe_q=64):
     """
-    使用标准注意力机制替代块稀疏注意力实现
+    以条带(Stripe)方式做 SDPA，显著降低显存峰值。
+    假设 batch=1（与原实现一致），输入 q/k/v 原形如 [B*Sq, H, D] / [B*Sk, H, D]。
     """
-    batch_size = 1
-    seq_len_q = q.shape[0] // batch_size
-    seq_len_k = k.shape[0] // batch_size
-    num_heads = q.shape[1]
-    head_dim = q.shape[2]
-    
-    # 重塑张量为标准注意力格式
-    q = q.view(batch_size, seq_len_q, num_heads, head_dim).transpose(1, 2)  # (B, H, S_q, D)
-    k = k.view(batch_size, seq_len_k, num_heads, head_dim).transpose(1, 2)  # (B, H, S_k, D)
-    v = v.view(batch_size, seq_len_k, num_heads, head_dim).transpose(1, 2)  # (B, H, S_k, D)
-    
-    # 使用 F.scaled_dot_product_attention，它能更好地处理各种情况
-    if base_blockmask is not None:
-        if base_blockmask.dim() == 2:
-            attn_mask = base_blockmask.unsqueeze(0).unsqueeze(0)
-            attn_mask = attn_mask.expand(batch_size, num_heads, -1, -1)
-        elif base_blockmask.dim() == 4:
-            attn_mask = base_blockmask
-        else:
-            attn_mask = None
-        if attn_mask is not None:
-            _, _, mask_seq_q, mask_seq_k = attn_mask.shape
+    B = 1
+    Sq = q.shape[0] // B
+    Sk = k.shape[0] // B
+    H = q.shape[1]
+    D = q.shape[2]
 
-            target_seq_q = seq_len_q
-            target_seq_k = seq_len_k
-            #print(f"Attention mask shape: {attn_mask.shape},{target_seq_q},{target_seq_k}")
-            #Attention mask shape:  torch.Size([1, 12, 24, 96]),3072,12288
-            # 使用插值方法进行扩展，模式为 nearest 以保持稀疏结构
-            if mask_seq_q != target_seq_q or mask_seq_k != target_seq_k:
-                try:
-                    attn_mask = F.interpolate(
-                        attn_mask.float(), 
-                        size=(target_seq_q, target_seq_k), 
-                        mode='nearest'
-                    ).to(attn_mask.dtype)
-                except torch.OutOfMemoryError:
-                    # 如果直接插值OOM，则分块处理
-                    print("Direct interpolation OOM, using chunked processing")
-                    attn_mask = chunked_interpolate(attn_mask, (target_seq_q, target_seq_k))
-    else:
-        attn_mask = None
-    training=False 
-    try:
-        output = F.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=attn_mask if attn_mask is not None else None,
-            dropout_p=p_dropout if training else 0.0,
+    # 统一到 [B,H,S,D]
+    q = q.view(B, Sq, H, D).transpose(1, 2).contiguous()  # [B,H,Sq,D]
+    k = k.view(B, Sk, H, D).transpose(1, 2).contiguous()  # [B,H,Sk,D]
+    v = v.view(B, Sk, H, D).transpose(1, 2).contiguous()  # [B,H,Sk,D]
+
+    # 掩码常驻 CPU；每个条带再切片+插值+小片搬回 XPU
+    mask_cpu = None
+    if base_blockmask is not None:
+        m = base_blockmask
+        if m.dim() == 2:
+            m = m.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+        elif m.dim() == 3:
+            m = m.unsqueeze(0)               # [1,*,h,w]
+        mask_cpu = m.detach().to('cpu', dtype=torch.float32, non_blocking=False)
+
+    out_chunks = []
+    for qs in range(0, Sq, stripe_q):
+        qe = min(qs + stripe_q, Sq)
+        q_s = q[:, :, qs:qe, :]  # [B,H,qs,D]
+        
+        attn_mask_s = None
+        if mask_cpu is not None:
+            mh, mw = mask_cpu.shape[-2], mask_cpu.shape[-1]     # 原掩码高宽
+            # 与掩码尺寸取 min，避免空切片
+            qs0 = min(qs, mh)
+            qe0 = min(qe, mh)
+
+            # 只有当切片后高度>0 且 原始宽度>0 才处理，否则本条带不使用掩码
+            if (qe0 > qs0) and (mw > 0):
+                m_slice_cpu = mask_cpu[..., qs0:qe0, :]         # [B,*, h_slice, mw]
+
+                target_h = (qe - qs)
+                target_w = Sk
+
+                # 需要的话再插值：前提是输入高宽都 >0
+                if (m_slice_cpu.shape[-2] != target_h) or (m_slice_cpu.shape[-1] != target_w):
+                    if (m_slice_cpu.shape[-2] > 0) and (m_slice_cpu.shape[-1] > 0):
+                        m_slice_cpu = F.interpolate(
+                            m_slice_cpu, size=(target_h, target_w), mode='nearest'
+                        )
+                    else:
+                        m_slice_cpu = None
+
+                if m_slice_cpu is not None:
+                    attn_mask_s = m_slice_cpu.to(q_s.device, dtype=q_s.dtype, non_blocking=False)
+            # else: attn_mask_s 维持 None（该条带不施加掩码）
+
+        # 条带 SDPA（推理 dropout=0）
+        out_s = F.scaled_dot_product_attention(
+            q_s, k, v,
+            attn_mask=attn_mask_s,
+            dropout_p=0.0,
             is_causal=is_causal
-        )
-    except Exception:
-        attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        if attn_mask is not None:
-            if attn_mask.shape != attention_scores.shape:
-                min_shape = [min(a, b) for a, b in zip(attn_mask.shape, attention_scores.shape)]
-                attn_mask = attn_mask[:min_shape[0], :min_shape[1], :min_shape[2], :min_shape[3]]
-                attention_scores = attention_scores[:min_shape[0], :min_shape[1], :min_shape[2], :min_shape[3]]
-            if attn_mask.dtype == torch.bool:
-                attention_scores = attention_scores.masked_fill(~attn_mask, float('-inf'))
-            else:
-                attention_scores = attention_scores + attn_mask
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        output = torch.matmul(attention_weights, v)
-    output = output.transpose(1, 2).contiguous().view(batch_size * seq_len_q, num_heads, head_dim)
-    return output.squeeze(0) 
+        )  # [B,H,qs,D]
+        out_chunks.append(out_s)
+
+        # 释放条带中间量
+        del q_s, attn_mask_s, out_s
+        if hasattr(torch.xpu, "synchronize"):
+            torch.xpu.synchronize()
+        torch.xpu.empty_cache()
+
+    # 拼回 [B,H,Sq,D] -> [B*Sq,H,D] -> 与原接口一致
+    output = torch.cat(out_chunks, dim=2)
+    output = output.transpose(1, 2).contiguous().view(B * Sq, H, D)
+    return output.squeeze(0)
 
 def chunked_interpolate(tensor, target_size, chunk_size=1024):
     """

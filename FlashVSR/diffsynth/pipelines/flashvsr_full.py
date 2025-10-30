@@ -163,8 +163,6 @@ class FlashVSRFullPipeline(BasePipeline):
         self.use_unified_sequence_parallel = False
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
-        self.new_decoder=False
-        self.VAE=None
 
 
         print(r"""
@@ -235,14 +233,13 @@ class FlashVSRFullPipeline(BasePipeline):
         self.vae = model_manager.fetch_model("wan_video_vae")
 
     @staticmethod
-    def from_model_manager(model_manager: ModelManager, torch_dtype=None, device=None, upscale2x=False):
+    def from_model_manager(model_manager: ModelManager, torch_dtype=None, device=None, use_usp=False):
         if device is None: device = model_manager.device
         if torch_dtype is None: torch_dtype = model_manager.torch_dtype
         pipe = FlashVSRFullPipeline(device=device, torch_dtype=torch_dtype)
         pipe.fetch_models(model_manager)
         # 可选：统一序列并行入口（此处默认关闭）
         pipe.use_unified_sequence_parallel = False
-        
         return pipe
 
     def denoising_model(self):
@@ -297,42 +294,11 @@ class FlashVSRFullPipeline(BasePipeline):
         return {}
 
     def encode_video(self, input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-
         latents = self.vae.encode(input_video, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
 
-    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)): #torch.Size([1, 16, 20, 128, 96])
-        if self.new_decoder:
-            self.vae.to("cpu")
-            if self.VAE.__class__.__name__ == "AutoencoderKLWan":
-                print("new_decoder is upscale")
-                if tiled:
-                    self.VAE.enable_tiling()
-                else:
-                    self.VAE.disable_tiling()
-                mean_tensor = torch.tensor(self.VAE.config.latents_mean, device=self.VAE.device, dtype=self.VAE.dtype).view(1, -1, 1, 1, 1)
-                std_tensor = torch.tensor(self.VAE.config.latents_std, device=self.VAE.device, dtype=self.VAE.dtype).view(1, -1, 1, 1, 1)
-                latents = latents * std_tensor + mean_tensor
-                decoder_out = self.VAE.decode(latents, return_dict=False)[0] # -->[B, 12, F, H, W] 
-                ch = decoder_out.shape[1]
-                if ch == 3:
-                    upscale = 1
-                else:
-                    if ch % 3 == 0:
-                        upscale = round((ch // 3) ** 0.5)
-                    else:
-                        upscale = 1
-                frames = F.pixel_shuffle(decoder_out.movedim(2, 1), upscale_factor=int(upscale)).movedim(1, 2) # pixel shuffle needs [..., C, H, W] format #torch.Size([1, 3, 77, 2048, 1536])
-            else:
-                print("new_decoder is light")
-                if tiled:
-                    self.VAE.use_tiling=True
-                else:
-                    self.VAE.use_tiling=False
-                #print(latents.shape)
-                frames=self.VAE.decode(latents.squeeze(0))
-        else:
-            frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
+        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return frames
 
     @torch.no_grad()

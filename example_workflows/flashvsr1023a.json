@@ -1,0 +1,383 @@
+{
+  "id": "9c750e57-c31b-48bb-892b-6750cd511e79",
+  "revision": 0,
+  "last_node_id": 14,
+  "last_link_id": 22,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "FlashVSR_SM_Model",
+      "pos": [
+        918.0643920898438,
+        764.147705078125
+      ],
+      "size": [
+        270,
+        178
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "FlashVSR_SM_Model",
+          "type": "FlashVSR_SM_Model",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSR_SM_Model"
+      },
+      "widgets_values": [
+        "diffusion_pytorch_model_streaming_dmd.safetensors",
+        "LQ_proj_in.ckpt",
+        "posi_prompt.pth",
+        "none",
+        "TCDecoder.ckpt",
+        false
+      ]
+    },
+    {
+      "id": 7,
+      "type": "FlashVSR_SM_KSampler",
+      "pos": [
+        1489.784423828125,
+        781.6717529296875
+      ],
+      "size": [
+        270,
+        414
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "FlashVSR_SM_Model",
+          "link": 11
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 13
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": 20
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSR_SM_KSampler"
+      },
+      "widgets_values": [
+        512,
+        512,
+        1866021881,
+        "fixed",
+        1,
+        3.5,
+        11,
+        1,
+        1,
+        2,
+        true,
+        true,
+        "wavelet",
+        81
+      ]
+    },
+    {
+      "id": 8,
+      "type": "GetVideoComponents",
+      "pos": [
+        1245.8780517578125,
+        921.1396484375
+      ],
+      "size": [
+        140,
+        66
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 19
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            13
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            18
+          ]
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": [
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 10,
+      "type": "CreateVideo",
+      "pos": [
+        1792.49658203125,
+        782.8536376953125
+      ],
+      "size": [
+        270,
+        78
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 15
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 18
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        30
+      ]
+    },
+    {
+      "id": 14,
+      "type": "SaveVideo",
+      "pos": [
+        2166.44140625,
+        765.4695434570312
+      ],
+      "size": [
+        751.2999877929688,
+        1099.7332763671875
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 22
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/ComfyUI",
+        "mp4",
+        "h264"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "FlashVSR_SM_VideoPathLoop",
+      "pos": [
+        896.3206787109375,
+        1044.94091796875
+      ],
+      "size": [
+        294.9908142089844,
+        286
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "reset_bool",
+          "shape": 7,
+          "type": "NUMBER",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            19
+          ]
+        },
+        {
+          "name": "number",
+          "type": "NUMBER",
+          "links": null
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "links": [
+            20
+          ]
+        },
+        {
+          "name": "filename",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSR_SM_VideoPathLoop"
+      },
+      "widgets_values": [
+        "D:\\Downloads\\123",
+        767589816,
+        "randomize",
+        0,
+        0,
+        1,
+        "increment",
+        "none"
+      ]
+    }
+  ],
+  "links": [
+    [
+      11,
+      1,
+      0,
+      7,
+      0,
+      "FlashVSR_SM_Model"
+    ],
+    [
+      13,
+      8,
+      0,
+      7,
+      1,
+      "IMAGE"
+    ],
+    [
+      15,
+      7,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      17,
+      8,
+      2,
+      10,
+      2,
+      "FLOAT"
+    ],
+    [
+      18,
+      8,
+      1,
+      10,
+      1,
+      "AUDIO"
+    ],
+    [
+      19,
+      13,
+      0,
+      8,
+      0,
+      "VIDEO"
+    ],
+    [
+      20,
+      13,
+      2,
+      7,
+      2,
+      "INT"
+    ],
+    [
+      22,
+      10,
+      0,
+      14,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.7513148009015777,
+      "offset": [
+        -709.9394184309257,
+        -656.2046602132035
+      ]
+    },
+    "frontendVersion": "1.26.13",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
