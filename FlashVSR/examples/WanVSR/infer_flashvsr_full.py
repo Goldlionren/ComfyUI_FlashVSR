@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+import torch.nn.functional as F
 import os, re, time
 import numpy as np
 from PIL import Image
@@ -12,6 +12,7 @@ import folder_paths
 from ...diffsynth import ModelManager, FlashVSRFullPipeline
 from .utils.utils import Buffer_LQ4x_Proj
 from comfy.utils import common_upscale
+from safetensors.torch import load_file
 
 def tensor2video(frames):
     frames = rearrange(frames, "C T H W -> T H W C")
@@ -241,11 +242,31 @@ def prepare_input_tensor(path, scale: int = 4,fps=30,dtype=torch.bfloat16, devic
     else:
         raise ValueError(f"Unsupported input: {path}")
 
-def init_pipeline(prompt_path,LQ_proj_in_path="./FlashVSR/LQ_proj_in.ckpt",ckpt_path: str = "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors", vae_path: str = "./FlashVSR/Wan2.1_VAE.pth",device="cuda"):
+def init_pipeline(prompt_path,LQ_proj_in_path="./FlashVSR/LQ_proj_in.ckpt",ckpt_path: str = "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors", vae_path: str = "./FlashVSR/Wan2.1_VAE.pth",decode_vae="none",cur_dir="",device="cuda"):
     #print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
+    new_decoder=True if decode_vae!="none"  else False
     mm.load_models([ckpt_path,vae_path,])
     pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
+    
+    if new_decoder:
+        pipe.new_decoder = True
+        if "light" in decode_vae.lower() or "tae" in decode_vae.lower():
+            from ...vae import WanVAE
+            print("use lightvae decoder")
+            VAE = WanVAE(vae_path=decode_vae,dtype=torch.bfloat16,device=device,use_lightvae=True)
+            pipe.VAE=VAE
+        else:    
+            print("use upscale2x decoder")
+            from diffusers import AutoencoderKLWan
+            config=AutoencoderKLWan.load_config(os.path.join(cur_dir,"FlashVSR/examples/config.json"))
+            VAE=AutoencoderKLWan.from_config(config).to(device,dtype=torch.bfloat16)
+            vae_dict=load_file(decode_vae,device="cpu")
+            VAE.load_state_dict(vae_dict,strict=False)
+            pipe.VAE=VAE
+            del vae_dict
+    
+        
     pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
     if os.path.exists(LQ_proj_in_path):
         pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu",weights_only=False), strict=True)
@@ -285,9 +306,21 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
             frames = pipe.decode_video(frames, **tiler_kwargs)
         except:
             print("vae decode_video OOM.try split latent" )
-            pipe.vae.to('cpu')
-            torch.cuda.empty_cache()   
-            pipe.vae.to('cuda')
+            if pipe.new_decoder:
+                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
+                    pipe.VAE.to('cpu')
+                else:
+                    pipe.VAE.to_cpu()
+            else:
+                pipe.vae.to('cpu')
+            torch.cuda.empty_cache()  
+            if pipe.new_decoder:
+                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
+                    pipe.VAE.to('cuda') 
+                else:
+                    pipe.VAE.to_cuda()
+            else:
+                pipe.vae.to('cuda')
             total_frames = frames.shape[2]
             segment_size = (split_num-1) * 2 // 4 # 40
             decoded_frames_list = []
@@ -302,6 +335,9 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
                 if pad_first_frame:
                     frames = dup_first_frame_1cthw_simple(frames)
                     LQ=dup_first_frame_1cthw_simple(LQ)
+                if pipe.new_decoder and LQ.shape[-1]!=frames.shape[-1]:
+                    scale_=int(frames.shape[-1]/LQ.shape[-1])
+                    LQ=upscale_lq_video_bilinear(LQ,scale_)
                 frames = pipe.ColorCorrector(
                     frames.to(device=device),
                     LQ[:, :, :frames.shape[2], :, :],
@@ -322,3 +358,17 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
     if save_vodeo_:
         save_video(frames, os.path.join(folder_paths.get_output_directory(),f"FlashVSR_Full_seed{seed}.mp4"), fps=fps, quality=6)
     return frames
+
+def upscale_lq_video_bilinear(LQ_video,scale_):
+    B, C, T, H, W = LQ_video.shape
+    LQ_reshaped = LQ_video.view(B*T, C, H, W) 
+    HQ_reshaped = F.interpolate(
+        LQ_reshaped, 
+        size=(H*scale_, W*scale_),
+        mode='bilinear', 
+        align_corners=False
+    )
+    
+    HQ_video = HQ_reshaped.view(B, C, T, H*scale_, W*scale_)
+    
+    return HQ_video
