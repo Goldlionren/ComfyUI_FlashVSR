@@ -432,7 +432,6 @@ def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt
     
     if os.path.exists(LQ_proj_in_path):
         pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu",weights_only=False,), strict=True)
-    pipe.denoising_model().LQ_proj_in.to(device)
     
     multi_scale_channels = [512, 256, 128, 128]
     pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
@@ -443,7 +442,7 @@ def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt
     pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
     return pipe
 
-def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=161,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
+def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
     pipe.to('cuda')
 
     _vram = VRAMMeter(devices=("cuda:0","cuda:1"))

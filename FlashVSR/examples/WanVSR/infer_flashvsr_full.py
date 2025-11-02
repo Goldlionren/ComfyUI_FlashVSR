@@ -14,6 +14,250 @@ from .utils.utils import Buffer_LQ4x_Proj
 from comfy.utils import common_upscale
 from safetensors.torch import load_file
 
+# === extra imports for AMP/offload/VRAM ===
+import os, csv, time, gc
+from contextlib import contextmanager, suppress
+
+# =============== VRAM meter (minimal, low-intrusion) ===============
+VRAM_LOG = os.environ.get("VRAM_LOG", "1") == "1"   # set 0 to disable
+VRAM_CSV = os.environ.get("VRAM_CSV", "vram_log.csv")
+
+def _bytes_mb(x): 
+    return round(x / (1024**2), 1)
+
+class VRAMMeter:
+    def __init__(self, devices=("cuda:0","cuda:1")):
+        self.enabled = VRAM_LOG and torch.cuda.is_available()
+        self.devices = [torch.device(d) for d in devices] if self.enabled else []
+        self.rows = []
+        self.t0 = time.time()
+        if self.enabled:
+            for d in self.devices:
+                with torch.cuda.device(d):
+                    torch.cuda.reset_peak_memory_stats(d)
+
+    def snap(self, tag):
+        if not self.enabled: 
+            return
+        t = round(time.time() - self.t0, 3)
+        for d in self.devices:
+            alloc = torch.cuda.memory_allocated(d)
+            resv  = torch.cuda.memory_reserved(d)
+            peak  = torch.cuda.max_memory_allocated(d)
+            free,total = torch.cuda.mem_get_info(d)
+            self.rows.append({
+                "t_sec": t, "tag": tag, "device": str(d),
+                "allocated_MB": _bytes_mb(alloc),
+                "reserved_MB":  _bytes_mb(resv),
+                "peak_MB":      _bytes_mb(peak),
+                "free_MB":      _bytes_mb(free),
+                "total_MB":     _bytes_mb(total),
+            })
+
+    def reset_peak(self, device):
+        if self.enabled:
+            torch.cuda.reset_peak_memory_stats(torch.device(device))
+
+    def to_csv(self, path=VRAM_CSV):
+        if not (self.enabled and self.rows):
+            return
+        fieldnames = list(self.rows[0].keys())
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(self.rows)
+        print(f"[VRAMMeter] CSV written -> {os.path.abspath(path)}")
+# ===================================================================
+
+# ================= AMP config (bf16/fp16, old/new torch) ===========
+AMP_DTYPE = "bf16"  # or "fp16"
+def _amp_dtype():
+    return torch.bfloat16 if AMP_DTYPE.lower() == "bf16" else torch.float16
+
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+with suppress(Exception):
+    torch.set_float32_matmul_precision("high")
+
+@contextmanager
+def _amp_cast(dtype):
+    # torch>=2.0
+    if hasattr(torch, "autocast"):
+        with torch.autocast("cuda", dtype=dtype):
+            yield
+    else:
+        # older torch
+        from torch.cuda.amp import autocast as _old
+        with _old(dtype=dtype):
+            yield
+# ===================================================================
+
+# ================== Offload & OOM helpers ==========================
+def _safe_to(module, device: str):
+    if module is None:
+        return
+    with suppress(Exception):
+        module.to(device)
+
+def _offload_non_decode_modules(pipe, keep=("VAE", "ColorCorrector")):
+    # Offload anything not needed for decode to CPU
+    for name, sub in list(vars(pipe).items()):
+        if name in keep:
+            continue
+        if hasattr(sub, "to") or hasattr(sub, "__class__"):
+            _safe_to(sub, "cpu")
+    # Aggressive: delete heavy attributes if present
+    for k in ["UNet","SRNet","Enhancer","FlowNet","OpticalFlow",
+              "FeatureExtractor","Refiner","TextEncoder","KVCache",
+              "KernelUp","PriorNet","AuxNet","dit"]:
+        if k in keep: 
+            continue
+        if hasattr(pipe, k):
+            with suppress(Exception):
+                delattr(pipe, k)
+    gc.collect()
+    with suppress(Exception):
+        torch.cuda.empty_cache()
+
+def _pick_secondary_decode_device(primary_device: str = "cuda:0") -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        n = torch.cuda.device_count()
+    except Exception:
+        n = 1
+    if n >= 2 and primary_device != "cuda:1":
+        return "cuda:1"
+    return None
+
+def _is_oom_error(e: BaseException) -> bool:
+    msg = str(e).lower()
+    kw = ["out of memory","allocation on device","cuda error: out of memory",
+          "cublas status alloc failed","c10::error"]
+    return any(k in msg for k in kw)
+
+def _move_vae(pipe, device: str):
+    """
+    Move VAE to the exact target device.
+    Important: WanVAE.to_cuda() always uses 'cuda:0', so DO NOT call it when we need cuda:1.
+    """
+    vae_attr = "VAE" if getattr(pipe, "new_decoder", False) else "vae"
+    vae = getattr(pipe, vae_attr, None)
+    if vae is None:
+        return
+
+    cls_name = getattr(vae, "__class__", type("X",(object,),{})).__name__
+
+    # diffusers AutoencoderKLWan 或 其它：常规 .to() 就行
+    if cls_name != "WanVAE":
+        with suppress(Exception):
+            vae.to(device)
+        return
+
+    # ---- 专门处理 WanVAE：显式搬到目标设备，而不是用 to_cuda()/to_cpu() ----
+    target = device
+    if device.startswith("cuda"):
+        # model & 子模块
+        with suppress(Exception):
+            vae.model.to(target)
+        with suppress(Exception):
+            vae.model.encoder.to(target)
+        with suppress(Exception):
+            vae.model.decoder.to(target)
+        # 非注册常量
+        with suppress(Exception):
+            vae.mean = vae.mean.to(target, non_blocking=True)
+            vae.inv_std = vae.inv_std.to(target, non_blocking=True)
+            vae.scale = [vae.mean, vae.inv_std]
+    else:
+        # 回 CPU
+        with suppress(Exception):
+            vae.model.to("cpu")
+        with suppress(Exception):
+            vae.model.encoder.to("cpu")
+        with suppress(Exception):
+            vae.model.decoder.to("cpu")
+        with suppress(Exception):
+            vae.mean = vae.mean.cpu()
+            vae.inv_std = vae.inv_std.cpu()
+            vae.scale = [vae.mean, vae.inv_std]
+
+from contextlib import suppress
+
+def _clear_vae_feature_cache(vae_obj):
+    """
+    Drop any feature caches kept by the VAE or its inner model/decoder.
+    Avoid cross-device tensors when we switch cuda:0 -> cuda:1.
+    """
+    if vae_obj is None:
+        return
+
+    # diffusers AutoencoderKLWan sometimes has these
+    for attr in ("_feat_map", "_conv_idx"):
+        if hasattr(vae_obj, attr):
+            with suppress(Exception):
+                setattr(vae_obj, attr, None if attr == "_feat_map" else 0)
+
+    # custom WanVAE wrapper -> inner model exposes clear_cache()
+    inner = getattr(vae_obj, "model", None)
+    if inner is not None and hasattr(inner, "clear_cache"):
+        with suppress(Exception):
+            inner.clear_cache()
+
+    # also try decoder-level caches (custom implementations)
+    dec = getattr(vae_obj, "decoder", None)
+    for obj in (vae_obj, inner, dec):
+        if obj is None:
+            continue
+        for attr in ("feat_cache", "_feat_cache", "_feat_map", "_enc_feat_map"):
+            if hasattr(obj, attr):
+                with suppress(Exception):
+                    setattr(obj, attr, None)
+        for attr in ("_conv_idx", "_enc_conv_idx"):
+            if hasattr(obj, attr):
+                with suppress(Exception):
+                    setattr(obj, attr, 0)
+
+def _align_vae_constants_device(vae_obj, device: str):
+    """
+    Some VAE impls keep scale/mean/std as plain attributes (lists/tuples of tensors),
+    which .to(device) won't move. Force-move them to the target device.
+    """
+    if vae_obj is None:
+        return
+
+    def _move_attr(obj, name):
+        val = getattr(obj, name, None)
+        if torch.is_tensor(val):
+            setattr(obj, name, val.to(device, non_blocking=True))
+        elif isinstance(val, (list, tuple)):
+            moved = []
+            changed = False
+            for x in val:
+                if torch.is_tensor(x):
+                    moved.append(x.to(device, non_blocking=True)); changed = True
+                else:
+                    moved.append(x)
+            if changed:
+                setattr(obj, name, type(val)(moved))
+
+    # common field names across WanVAE / AutoencoderKLWan variants
+    for nm in ["scale", "scaler", "scaler_mean", "scaler_std",
+               "mean", "std", "mean_tensor", "std_tensor"]:
+        _move_attr(vae_obj, nm)
+
+    # inner model/decoder may also host these constants
+    for inner_name in ["model", "decoder"]:
+        inner = getattr(vae_obj, inner_name, None)
+        if inner is not None:
+            for nm in ["scale", "scaler", "scaler_mean", "scaler_std",
+                       "mean", "std", "mean_tensor", "std_tensor"]:
+                _move_attr(inner, nm)
+
+# ===================================================================
+
+
 def tensor2video(frames):
     frames = rearrange(frames, "C T H W -> T H W C")
     try:
@@ -135,14 +379,14 @@ def prepare_input_tensor(path, scale: int = 4,fps=30,dtype=torch.bfloat16, devic
             path = path.repeat(25, 1, 1, 1) 
             total=25
         sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
-        pil_list=tensor2pillist(path)
+        pil_list = tensor2pillist(path)
         idx = list(range(total)) + [total - 1] * 4
         F = largest_8n1_leq(len(idx))
         idx = idx[:F]
         frames = []
         pil_list = [pil_list[i] for i in idx]
-        for i in idx:
-            img = pil_list[i].convert('RGB')
+        for img in pil_list:                       # ← iterate sublist directly
+            img = img.convert('RGB')
             img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
             frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))
         frames = torch.stack(frames, 0).permute(1,0,2,3).unsqueeze(0)  # 1 C F H W  
@@ -167,12 +411,13 @@ def prepare_input_tensor(path, scale: int = 4,fps=30,dtype=torch.bfloat16, devic
             raise RuntimeError(f"Not enough frames after padding in {path}. Got {len(paths)}.")
         paths = paths[:F]
         print(f"[{os.path.basename(path)}] Target Frames (8n-3): {F-4}")
-
+        
         frames = []
         for p in paths:
-            with Image.open(p).convert('RGB') as img:
-                img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)   
-            frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))             
+            with Image.open(p) as _im:             # ← fix context manager misuse
+                img = _im.convert('RGB')
+            img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
+            frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))   
         vid = torch.stack(frames, 0).permute(1,0,2,3).unsqueeze(0)             
         fps = 30
         return vid, tH, tW, F, fps
@@ -290,9 +535,12 @@ def init_pipeline(prompt_path,LQ_proj_in_path="./FlashVSR/LQ_proj_in.ckpt",ckpt_
 
 
 
-def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,tiled=True,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda",save_vodeo_=False,):
+def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,tiled=True,color_fix=True,fix_method="wavelet",split_num=161,dtype=torch.bfloat16,device="cuda",save_vodeo_=False,):
     pipe.to('cuda')  #pipe.enable_vram_management(num_persistent_param_in_dit=None)
     #pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
+    _vram = VRAMMeter(devices=("cuda:0","cuda:1"))
+    _vram.snap("start")
+
     pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
 
     #total,h0,w0,_ = input.shape
@@ -310,41 +558,95 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
     )
     pipe.dit.to('cpu')
     torch.cuda.empty_cache()
-    #torch.Size([1, 16, 20, 48, 80])
+
     tiler_kwargs = {"tiled": tiled, "tile_size": (60, 104), "tile_stride": (30, 52)}
     with torch.no_grad():
+        def _decode_on(device_for_decode: str, use_segment_fallback: bool = True):
+            # Move only VAE to target device; keep others offloaded
+            _move_vae(pipe, device_for_decode)
+
+            # 调用 _move_vae(pipe, device_for_decode) 之后临时加：
+            try:
+                p = next(pipe.VAE.model.parameters()).device
+                print(f"[debug] WanVAE weights device -> {p}, target={device_for_decode}")
+            except Exception as _e:
+                pass
+
+            # ---- NEW: move latents to target device & clear VAE feature cache ----
+            frames_local = frames.to(device_for_decode, non_blocking=True)
+
+            # NEW: drop stale feature caches from previous device
+            _clear_vae_feature_cache(getattr(pipe, "VAE", None))
+            
+            # ★ 新增：把 VAE 的标定常量也同步到目标卡
+            _align_vae_constants_device(getattr(pipe, "VAE", None), device_for_decode)
+
+            if hasattr(pipe, "VAE"):
+                if hasattr(pipe.VAE, "_feat_map"):
+                    pipe.VAE._feat_map = None
+                if hasattr(pipe.VAE, "_conv_idx"):
+                    with suppress(Exception):
+                        pipe.VAE._conv_idx = 0
+            # ---------------------------------------------------------------------
+
+            _vram.reset_peak(device_for_decode)
+            _vram.snap(f"decode_enter:{device_for_decode}")
+
+            amp_dtype = _amp_dtype()
+            try:
+                with _amp_cast(amp_dtype):
+                    out_full = pipe.decode_video(frames_local, **tiler_kwargs)
+                _vram.snap(f"decode_done_once:{device_for_decode}")
+                return out_full
+            except RuntimeError as e:
+                if not (_is_oom_error(e) and use_segment_fallback):
+                    raise
+                print(f"VAE decode OOM on {device_for_decode}. Falling back to segmented decoding...")
+
+                total_frames = frames_local.shape[2]
+                # keep your original heuristic, but CPU-dump each chunk to reduce VRAM peak
+                segment_size = max(1, (split_num - 1) * 2 // 4)
+                decoded_cpu = []
+                for start_idx in range(0, total_frames, segment_size):
+                    end_idx = min(start_idx + segment_size, total_frames)
+                    seg = frames_local[:, :, start_idx:end_idx, :, :].to(device_for_decode, non_blocking=True)
+                    
+                    _clear_vae_feature_cache(getattr(pipe, "VAE", None))  # NEW
+                    _align_vae_constants_device(getattr(pipe, "VAE", None), device_for_decode)  # ★ 新增
+
+
+                    with _amp_cast(amp_dtype):
+                        dec_seg = pipe.decode_video(seg, **tiler_kwargs)
+                    dec_seg = dec_seg.to("cpu", non_blocking=True)  # ← dump to CPU immediately
+                    decoded_cpu.append(dec_seg)
+                    del seg, dec_seg
+                    with suppress(Exception):
+                        torch.cuda.empty_cache()
+                    _vram.snap(f"seg_post_cpu_dump:{device_for_decode}:{start_idx}-{end_idx}")
+                frames_cat = torch.cat(decoded_cpu, dim=2)     # cat on CPU
+
+                _vram.snap("cpu_cat_done")
+                return frames_cat
+
         try:
-            frames = pipe.decode_video(frames, **tiler_kwargs)
-        except:
-            print("vae decode_video OOM.try split latent" )
-            if pipe.new_decoder:
-                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
-                    pipe.VAE.to('cpu')
-                else:
-                    if pipe.VAE.__class__.__name__ == "WanVAE":
-                        pipe.VAE.to_cpu()
-                    else: pass
+            # 1) Offload non-decode modules then try on primary device first
+            _offload_non_decode_modules(pipe, keep=("VAE","ColorCorrector"))
+            frames = _decode_on(device_for_decode=device, use_segment_fallback=False)
+        except RuntimeError as e0:
+            if not _is_oom_error(e0):
+                raise
+            # 2) Try secondary GPU (e.g., cuda:1); else segment on primary
+            dev1 = _pick_secondary_decode_device(primary_device=device)
+            if dev1 is None:
+                print("Decode OOM and no secondary GPU. Trying segmented decode on primary...")
+                _offload_non_decode_modules(pipe, keep=("VAE","ColorCorrector"))
+                frames = _decode_on(device_for_decode=device, use_segment_fallback=True)
             else:
-                pipe.vae.to('cpu')
-            torch.cuda.empty_cache()  
-            if pipe.new_decoder:
-                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
-                    pipe.VAE.to('cuda') 
-                else:
-                    if pipe.VAE.__class__.__name__ == "WanVAE":
-                        pipe.VAE.to_cuda()
-                    else: pass
-            else:
-                pipe.vae.to('cuda')
-            total_frames = frames.shape[2]
-            segment_size = (split_num-1) * 2 // 4 # 40
-            decoded_frames_list = []
-            for start_idx in range(0, total_frames, segment_size):
-                end_idx = min(start_idx + segment_size, total_frames)
-                frames_segment = frames[:, :, start_idx:end_idx, :, :]          
-                decoded_segment = pipe.decode_video(frames_segment, **tiler_kwargs)
-                decoded_frames_list.append(decoded_segment)
-            frames = torch.cat(decoded_frames_list, dim=2)  
+                print(f"Decode OOM on {device}. Retrying on {dev1}...")
+                _offload_non_decode_modules(pipe, keep=("VAE","ColorCorrector"))
+                frames = _decode_on(device_for_decode=dev1, use_segment_fallback=True)
+                # bring back to primary for post-proc
+                frames = frames.to(device, non_blocking=True)
         try:
             if color_fix:
                 if pad_first_frame:
@@ -365,13 +667,16 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
         except:
             pass
         print("Done.")
-        pipe.vae.to('cpu')  
+        with suppress(Exception):
+            pipe.vae.to('cpu')
     del LQ
     torch.cuda.empty_cache()    
     frames = tensor2video(frames[0])   
     
     if save_vodeo_:
         save_video(frames, os.path.join(folder_paths.get_output_directory(),f"FlashVSR_Full_seed{seed}.mp4"), fps=fps, quality=6)
+    _vram.snap("end")
+    _vram.to_csv()
     return frames
 
 def upscale_lq_video_bilinear(LQ_video,scale_):
