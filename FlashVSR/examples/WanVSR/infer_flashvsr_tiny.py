@@ -14,6 +14,197 @@ from .utils.utils import Buffer_LQ4x_Proj
 from .utils.TCDecoder import build_tcdecoder
 
 
+####监控工具#####
+import csv
+
+VRAM_LOG = os.environ.get("VRAM_LOG", "1") == "1"   # 设置 0 可关闭
+VRAM_CSV = os.environ.get("VRAM_CSV", "vram_log.csv")  # 默认写到工作目录
+
+def _bytes_mb(x): 
+    return round(x / (1024**2), 1)
+
+def _dev_str(dev):
+    return str(dev) if isinstance(dev, str) else f"cuda:{dev.index if hasattr(dev, 'index') else dev}"
+
+class VRAMMeter:
+    def __init__(self, devices=("cuda:0","cuda:1")):
+        self.devices = [torch.device(d) for d in devices if torch.cuda.device_count() > 0]
+        self.rows = []
+        self.t0 = time.time()
+        # 初始清零峰值
+        for d in self.devices:
+            with torch.cuda.device(d):
+                torch.cuda.reset_peak_memory_stats(d)
+
+    def snap(self, tag):
+        if not VRAM_LOG or not torch.cuda.is_available():
+            return
+        t = time.time() - self.t0
+        for d in self.devices:
+            alloc = torch.cuda.memory_allocated(d)
+            resv  = torch.cuda.memory_reserved(d)
+            peak  = torch.cuda.max_memory_allocated(d)
+            free,total = torch.cuda.mem_get_info(d)
+            self.rows.append({
+                "t": round(t,3),
+                "tag": tag,
+                "device": _dev_str(d),
+                "allocated_MB": _bytes_mb(alloc),
+                "reserved_MB":  _bytes_mb(resv),
+                "peak_MB":      _bytes_mb(peak),
+                "free_MB":      _bytes_mb(free),
+                "total_MB":     _bytes_mb(total),
+            })
+
+    def reset_peak(self, device):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+
+    def to_csv(self, path=VRAM_CSV):
+        if not self.rows: 
+            return
+        fieldnames = list(self.rows[0].keys())
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(self.rows)
+        print(f"[VRAMMeter] CSV written -> {os.path.abspath(path)}")
+
+# 全局一个实例（也可放到 run_inference_tiny 里局部创建）
+_vram = VRAMMeter(devices=("cuda:0","cuda:1"))
+
+
+
+
+
+import gc
+from contextlib import suppress
+
+def _safe_to(module, device: str):
+    if module is None: 
+        return
+    try:
+        module.to(device)
+    except Exception:
+        # 有些容器/包装器没有 .to，直接忽略
+        pass
+
+def _offload_non_decode_modules(pipe, keep=("TCDecoder", "VAE", "ColorCorrector")):
+    """
+    将不在 keep 列表里的子模块一律下放到 CPU（或直接释放）。
+    根据你的 pipe 结构，常见可下放的模块例如：
+      - UNet / SRNet / EnhanceNet / Refiners
+      - FlowNet / OpticalFlow / SpatioTemporal 模块
+      - Text/Image encoder、Embedding、KV 缓存
+      - 任何不参与 decode 的辅助网络
+    """
+    # 你自己清楚 pipeline 里有啥，这里尽量“保守识别、广泛下放”
+    for name, sub in list(vars(pipe).items()):
+        if name in keep:
+            continue
+        # 跳过非模块对象
+        if not hasattr(sub, "to") and not hasattr(sub, "__class__"):
+            continue
+
+        # 优先选择“下放到 CPU”，如果你确认后面不再用，也可以直接 del 掉
+        with suppress(Exception):
+            _safe_to(sub, "cpu")
+
+    # 如果明确不再需要某些重型模块，可以直接释放引用（更激进）
+    maybe_delete = ["UNet", "SRNet", "Enhancer", "FlowNet", "OpticalFlow", 
+                    "FeatureExtractor", "Refiner", "TextEncoder", "KVCache",
+                    "KernelUp", "PriorNet", "AuxNet"]
+    for k in maybe_delete:
+        if k in keep:
+            continue
+        if hasattr(pipe, k):
+            try:
+                delattr(pipe, k)
+            except Exception:
+                pass
+
+    # 额外：把可能挂在 pipe 之外的重型缓存也清理（按你的代码环境调整）
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ====== 新增：放在文件顶部其它函数旁，或放到 run_inference_tiny 上方 ======
+def _pick_secondary_decode_device(primary_device: str = "cuda:0") -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        n = torch.cuda.device_count()
+    except Exception:
+        n = 1
+    # 简单策略：优先选 cuda:1 且不同于 primary
+    if n >= 2 and primary_device != "cuda:1":
+        return "cuda:1"
+    return None
+
+def _is_oom_error(e: BaseException) -> bool:
+    msg = str(e).lower()
+    # 类型判断（不同 torch 版本类名略有差异，全部兜底）
+    oom_type = (
+        getattr(torch, "OutOfMemoryError", RuntimeError),
+        getattr(torch.cuda, "OutOfMemoryError", RuntimeError),
+        RuntimeError,
+    )
+    if isinstance(e, oom_type):
+        # 常见关键词尽量全：包含你的 “Allocation on device”
+        keywords = [
+            "out of memory",
+            "cuda error: out of memory",
+            "allocation on device",
+            "cublas status alloc failed",
+            "c10::error",  # 有些版本会把 OOM 包成 c10::Error
+        ]
+        return any(k in msg for k in keywords)
+    # 再保险：纯字符串匹配
+    return any(k in msg for k in [
+        "out of memory", "allocation on device", "cuda error: out of memory",
+        "cublas status alloc failed", "c10::error"
+    ])
+
+
+# ===== precision config =====
+AMP_DTYPE = "bf16"  # 可改为 "fp16"
+
+def _amp_dtype():
+    import torch
+    return torch.bfloat16 if AMP_DTYPE.lower() == "bf16" else torch.float16
+
+# 轻微的 matmul 优化（Ada 40 系列可用）
+import torch
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+from contextlib import contextmanager
+
+@contextmanager
+def _amp_cast(dtype):
+    """
+    兼容老/新 PyTorch:
+    - 新版: torch.autocast("cuda", dtype=...)
+    - 旧版: torch.cuda.amp.autocast(dtype=...)
+    """
+    import torch
+    # 新式 API
+    if hasattr(torch, "autocast"):
+        with torch.autocast("cuda", dtype=dtype):
+            yield
+    else:
+        # 旧式 API
+        from torch.cuda.amp import autocast as _old_autocast
+        with _old_autocast(dtype=dtype):
+            yield
+
+
 def tensor2video(frames):
     frames = rearrange(frames, "C T H W -> T H W C")
     try:
@@ -252,8 +443,11 @@ def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt
     pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
     return pipe
 
-def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
+def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=161,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
     pipe.to('cuda')
+
+    _vram = VRAMMeter(devices=("cuda:0","cuda:1"))
+    _vram.snap("start")
 
     pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
 
@@ -271,42 +465,125 @@ def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,c
     pipe.dit.to('cpu')  
     torch.cuda.empty_cache()   
     #print(LQ.shape,frames.shape,LQ_cur_idx)#torch.Size([1, 3, 81, 384, 640]) torch.Size([1, 16, 20, 48, 80]) 77
+
+
+    # ====== 替换 run_inference_tiny 内部 with torch.no_grad(): 这一整段 try/except ======
+    # ====== decoding with fallback (same logic) + VRAM marks ======
     with torch.no_grad():
-        try:
-            frames = pipe.TCDecoder.decode_video(frames.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
-        except:
-            print("TCDecoder decode_video OOM.try split latent" )
-            pipe.TCDecoder.to('cpu')
-            torch.cuda.empty_cache()   
-            pipe.TCDecoder.to('cuda')
-            frames = frames.transpose(1, 2)  # 转换为 [B, T, C, H, W] 格式
-            cond_frames = LQ[:,:,:LQ_cur_idx,:,:]
-            segment_size = (split_num-1) * 2  # 160
-            latent_segment_size = segment_size // 4 # 40
-            decoded_frames_list = []
-            total_latent_frames = frames.shape[1]
-            for start_idx in range(0, total_latent_frames, latent_segment_size):
-                end_idx = min(start_idx + latent_segment_size, total_latent_frames)
-                
-                # 潜在空间的切片
-                frames_segment = frames[:, start_idx:end_idx, :, :, :]
-                
-                # 对应的条件帧（在原始空间中）
-                start_cond_idx = start_idx * 4
-                end_cond_idx = min(end_idx * 4 , LQ_cur_idx)
-                cond_segment = cond_frames[:, :, start_cond_idx:end_cond_idx, :, :]
-                
-                decoded_segment = pipe.TCDecoder.decode_video(
-                    frames_segment,
-                    parallel=False,
-                    show_progress_bar=False,
-                    cond=cond_segment
+        def _decode_on_device(target_device: str, use_segment_fallback: bool = True):
+            """在指定 device 上尝试解码；必要时用分段解码回退。返回解码后的 frames (1, C, T, H, W) in [-1,1]"""
+            # 把 TCDecoder 和需要参与解码的张量搬到目标设备
+            pipe.TCDecoder.to(target_device)
+            pipe.TCDecoder.clean_mem()  # ← 新增：换卡后清空 mem
+
+            _vram.reset_peak(target_device)
+            _vram.snap(f"decode_enter:{target_device}")
+
+            from torch.cuda.amp import autocast
+            amp_dtype = _amp_dtype()
+
+            fr = frames.transpose(1, 2).to(target_device, dtype=amp_dtype, non_blocking=True)          # [B,T,C,H,W] latent
+            cond_frames = LQ[:, :, :LQ_cur_idx, :, :].to(target_device, dtype=amp_dtype, non_blocking=True)
+
+            try:
+                with _amp_cast(_amp_dtype()):
+                    dec = pipe.TCDecoder.decode_video(
+                       fr, parallel=False, show_progress_bar=False, cond=cond_frames
                 )
-                decoded_frames_list.append(decoded_segment)
-            
-            decoded_frames = torch.cat(decoded_frames_list, dim=1)  # 
-            frames = decoded_frames.transpose(1, 2).mul_(2).sub_(1)
-        
+                out = dec.transpose(1, 2).mul_(2).sub_(1)  # [B,C,T,H,W] & [-1,1]
+                _vram.snap(f"decode_done_once:{target_device}")
+                return out
+            except RuntimeError as e:
+                # 只有 OOM 才考虑分段回退；非 OOM 直接抛出
+                is_oom = _is_oom_error(e)
+                if not (is_oom and use_segment_fallback):
+                    raise
+
+                # 分段回退（在 target_device 上）
+                print(f"TCDecoder OOM on {target_device}. Falling back to segmented decoding...")
+                segment_size = (split_num - 1) * 2       # e.g. 160
+                latent_segment_size = max(1, segment_size // 4)  # e.g. 40
+                decoded_chunks_cpu = []
+                total_latent_frames = fr.shape[1]
+
+                for start_idx in range(0, total_latent_frames, latent_segment_size):
+                    end_idx = min(start_idx + latent_segment_size, total_latent_frames)
+
+                    fr_seg = fr[:, start_idx:end_idx, :, :, :]  # [B, t, C, H, W]
+
+                    start_cond_idx = start_idx * 4
+                    end_cond_idx = min(end_idx * 4, LQ_cur_idx)
+                    cond_seg = cond_frames[:, :, start_cond_idx:end_cond_idx, :, :]
+
+                    pipe.TCDecoder.clean_mem()  # ← 新增：每段前清空 mem
+
+
+
+                    with _amp_cast(_amp_dtype()):
+                        dec_seg = pipe.TCDecoder.decode_video(
+                            fr_seg, parallel=False, show_progress_bar=False, cond=cond_seg
+                        )
+                    dec_seg = dec_seg.to("cpu", non_blocking=True)  # 及时搬回 CPU，释放显存
+                    decoded_chunks_cpu.append(dec_seg)
+
+                    # 段完成就把这些临时显存清掉
+                    del fr_seg, cond_seg, dec_seg
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    _vram.snap(f"seg_post_cpu_dump:{target_device}:{start_idx}-{end_idx}")
+
+                dec_all = torch.cat(decoded_chunks_cpu, dim=1)      # CPU 上拼接
+                out = dec_all.transpose(1, 2).mul_(2).sub_(1)       # 仍在 CPU
+                _vram.snap("cpu_cat_done")
+
+                # 需要回到后续设备（通常是 LQ.device/cuda:0）再继续
+                target_after = str(LQ.device)
+                out = out.to(target_after, non_blocking=True)
+
+                return out
+
+        try:
+            # 1) 先在当前流程设备上尝试一次（通常是 cuda:0）
+            # —— 解码前瘦身：只保留 TCDecoder / VAE / ColorCorrector —— 
+            _offload_non_decode_modules(pipe, keep=("TCDecoder", "VAE", "ColorCorrector"))
+            # 可选：如果 ColorCorrector 用得很晚，也可以先下放，等用到时再搬回
+            # _safe_to(pipe.ColorCorrector, "cpu")
+            # 需要使用时再：pipe.ColorCorrector.to(LQ.device)
+            frames = _decode_on_device(target_device=LQ.device, use_segment_fallback=False)
+        except RuntimeError as e0:
+            is_oom0 = _is_oom_error(e0)
+            if not is_oom0:
+                # 非 OOM 直接重抛
+                raise
+
+            # 2) OOM 时尝试把解码搬到次卡（cuda:1）
+            dev1 = _pick_secondary_decode_device(primary_device=str(LQ.device))
+            if dev1 is None:
+                print("TCDecoder decode OOM and no secondary GPU available. Trying segmented decode on primary...")
+                # 在原卡上改用分段解码
+                # —— 解码前瘦身：只保留 TCDecoder / VAE / ColorCorrector —— 
+                _offload_non_decode_modules(pipe, keep=("TCDecoder", "VAE", "ColorCorrector"))
+                # 可选：如果 ColorCorrector 用得很晚，也可以先下放，等用到时再搬回
+                # _safe_to(pipe.ColorCorrector, "cpu")
+                # 需要使用时再：pipe.ColorCorrector.to(LQ.device)
+                frames = _decode_on_device(target_device=LQ.device, use_segment_fallback=True)
+            else:
+                print(f"TCDecoder decode OOM on {LQ.device}. Retrying on {dev1}...")
+                # —— 解码前瘦身：只保留 TCDecoder / VAE / ColorCorrector —— 
+                _offload_non_decode_modules(pipe, keep=("TCDecoder", "VAE", "ColorCorrector"))
+                # 可选：如果 ColorCorrector 用得很晚，也可以先下放，等用到时再搬回
+                # _safe_to(pipe.ColorCorrector, "cpu")
+                # 需要使用时再：pipe.ColorCorrector.to(LQ.device)
+
+                frames = _decode_on_device(target_device=dev1, use_segment_fallback=True)
+                # 解码完成，把结果搬回 LQ.device，方便后续 ColorCorrector 使用
+                frames = frames.to(LQ.device, non_blocking=True)
+
+    # 颜色校正保持不变（frames 已经被搬回 LQ.device）
+
+
+
+
     # 颜色校正（wavelet）
     # shape: 1,16, 20, 64, 96
     try:
@@ -332,4 +609,6 @@ def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,c
     frames = tensor2video(frames[0]) 
     if save_vodeo_:
         save_video(frames, os.path.join(folder_paths.get_output_directory(),f"FlashVSR_Full_seed{seed}.mp4"), fps=fps, quality=6)
+    _vram.snap("end")
+    _vram.to_csv()
     return frames

@@ -133,22 +133,26 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
             else:
                 b = model[i]
                 if isinstance(b, MemBlock):
-                    if mem[i] is None:
-                        xt_new = b(xt, xt * 0)
-                        mem[i] = xt
+                # past 必须跟 xt 在同一张卡；否则用零张量
+                    if mem[i] is None or (torch.is_tensor(mem[i]) and mem[i].device != xt.device) or (not torch.is_tensor(mem[i])):
+                        past = xt.new_zeros(xt.shape)
                     else:
-                        xt_new = b(xt, mem[i])
-                        mem[i].copy_(xt)
+                        past = mem[i]
+                    xt_new = b(xt, past)
+                    # 不再用 copy_（会要求同设备且同 shape），直接覆盖为当前步的 xt
+                    mem[i] = xt.detach()
                     work_queue.insert(0, TWorkItem(xt_new, i+1))
                 elif isinstance(b, TPool):
-                    if mem[i] is None:
+                    if mem[i] is None or not isinstance(mem[i], list):
                         mem[i] = []
                     mem[i].append(xt)
                     if len(mem[i]) > b.stride:
                         raise ValueError("TPool internal state invalid.")
                     elif len(mem[i]) == b.stride:
                         N_, C_, H_, W_ = xt.shape
-                        xt = b(torch.cat(mem[i], 1).view(N_*b.stride, C_, H_, W_))
+                        # 保证拼接前所有块都在 xt.device
+                        chunks = [(t if t.device == xt.device else t.to(xt.device, non_blocking=True)) for t in mem[i]]
+                        xt = b(torch.cat(chunks, 1).view(N_ * b.stride, C_, H_, W_))
                         mem[i] = []
                         work_queue.insert(0, TWorkItem(xt, i+1))
                 elif isinstance(b, TGrow):
@@ -160,7 +164,25 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
                     xt = b(xt)
                     work_queue.insert(0, TWorkItem(xt, i+1))
         progress_bar.close()
-        x = torch.stack(out, 1)
+        try:
+            # 尝试在当前设备直接拼
+            x = torch.stack(out, 1)
+        except Exception as e:
+            # 如果是显存不足，走 CPU 回退再搬回
+            msg = str(e).lower()
+            is_oom = (
+                "out of memory" in msg
+                or "allocation on device" in msg
+                or "cublas status alloc failed" in msg
+                or "cuda error: out of memory" in msg
+                or "c10::error" in msg
+            )
+            if not is_oom:
+                raise
+            # 先把每帧移到 CPU 再 stack（减少一次性 GPU 峰值）
+            x_cpu = torch.stack([t.detach().to("cpu") for t in out], 1)
+            # 再搬回到原张量所在设备（与 out[0] 一致）
+            x = x_cpu.to(out[0].device, non_blocking=True)
     return x, mem
 
 # ----------------------------
@@ -255,6 +277,8 @@ class TAEHV(nn.Module):
         """Decode a sequence of frames from latents.
         x: NTCHW latent tensor; returns NTCHW RGB in ~[0, 1].
         """
+        self.clean_mem()  # ← 新增
+
         trim_flag = self.mem[-8] is None  # keeps original relative check
 
         if cond is not None:
