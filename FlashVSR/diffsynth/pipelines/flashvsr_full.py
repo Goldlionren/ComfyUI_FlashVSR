@@ -165,6 +165,7 @@ class FlashVSRFullPipeline(BasePipeline):
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
         self.new_decoder=False
         self.VAE=None
+        self.version="1.0"
 
 
         print(r"""

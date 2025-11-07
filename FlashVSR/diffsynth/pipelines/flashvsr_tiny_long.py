@@ -164,6 +164,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
         self.long_mode=True
+        self.version="1.0"
         print(r"""
 ███████╗██╗      █████╗ ███████╗██╗  ██╗██╗   ██╗███████╗█████╗
 ██╔════╝██║     ██╔══██╗██╔════╝██║  ██║██║   ██║██╔════╝██╔══██╗
