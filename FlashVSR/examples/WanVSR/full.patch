@@ -1,0 +1,346 @@
+*** a/infer_flashvsr_full.py
+--- b/infer_flashvsr_full.py
+@@
+-from PIL import Image
++from PIL import Image
+ import imageio
+ from tqdm import tqdm
+ import torch
+ from einops import rearrange
+ import folder_paths
+ from ...diffsynth import ModelManager, FlashVSRFullPipeline
+ from .utils.utils import Buffer_LQ4x_Proj
+ from comfy.utils import common_upscale
+ from safetensors.torch import load_file
++import os, csv, time, gc
++from contextlib import contextmanager, suppress
++
++# =================== VRAM meter (minimal, low-intrusion) ===================
++# Env:
++#   VRAM_LOG=0   -> disable logging (default: enabled)
++#   VRAM_CSV=... -> output csv path (default: vram_log.csv)
++VRAM_LOG = os.environ.get("VRAM_LOG", "1") == "1"
++VRAM_CSV = os.environ.get("VRAM_CSV", "vram_log.csv")
++
++def _bytes_mb(x): 
++    return round(x / (1024**2), 1)
++
++class VRAMMeter:
++    def __init__(self, devices=("cuda:0","cuda:1")):
++        self.enabled = VRAM_LOG and torch.cuda.is_available()
++        self.devices = [torch.device(d) for d in devices] if self.enabled else []
++        self.rows = []
++        self.t0 = time.time()
++        if self.enabled:
++            for d in self.devices:
++                with torch.cuda.device(d):
++                    torch.cuda.reset_peak_memory_stats(d)
++
++    def snap(self, tag):
++        if not self.enabled: 
++            return
++        t = round(time.time() - self.t0, 3)
++        for d in self.devices:
++            alloc = torch.cuda.memory_allocated(d)
++            resv  = torch.cuda.memory_reserved(d)
++            peak  = torch.cuda.max_memory_allocated(d)
++            free,total = torch.cuda.mem_get_info(d)
++            self.rows.append({
++                "t_sec": t,
++                "tag": tag,
++                "device": str(d),
++                "allocated_MB": _bytes_mb(alloc),
++                "reserved_MB":  _bytes_mb(resv),
++                "peak_MB":      _bytes_mb(peak),
++                "free_MB":      _bytes_mb(free),
++                "total_MB":     _bytes_mb(total),
++            })
++
++    def reset_peak(self, device):
++        if self.enabled:
++            torch.cuda.reset_peak_memory_stats(torch.device(device))
++
++    def to_csv(self, path=VRAM_CSV):
++        if not (self.enabled and self.rows):
++            return
++        fieldnames = list(self.rows[0].keys())
++        with open(path, "w", newline="") as f:
++            w = csv.DictWriter(f, fieldnames=fieldnames)
++            w.writeheader()
++            w.writerows(self.rows)
++        print(f"[VRAMMeter] CSV written -> {os.path.abspath(path)}")
++# ===========================================================================
++
++# =================== AMP config (bf16/fp16, old/new torch) =================
++AMP_DTYPE = "bf16"  # or "fp16"
++def _amp_dtype():
++    return torch.bfloat16 if AMP_DTYPE.lower() == "bf16" else torch.float16
++
++torch.backends.cudnn.benchmark = True
++torch.backends.cuda.matmul.allow_tf32 = True
++torch.backends.cudnn.allow_tf32 = True
++with suppress(Exception):
++    torch.set_float32_matmul_precision("high")
++
++@contextmanager
++def _amp_cast(dtype):
++    # torch>=2.0: torch.autocast("cuda", dtype=...)
++    if hasattr(torch, "autocast"):
++        with torch.autocast("cuda", dtype=dtype):
++            yield
++    else:
++        # older: torch.cuda.amp.autocast(dtype=...)
++        from torch.cuda.amp import autocast as _old
++        with _old(dtype=dtype):
++            yield
++# ===========================================================================
++
++# =================== Offload helpers & OOM helpers =========================
++def _safe_to(module, device: str):
++    if module is None:
++        return
++    with suppress(Exception):
++        module.to(device)
++
++def _offload_non_decode_modules(pipe, keep=("VAE", "ColorCorrector")):
++    # Offload any heavy modules not needed for decode to CPU
++    for name, sub in list(vars(pipe).items()):
++        if name in keep:
++            continue
++        if hasattr(sub, "to") or hasattr(sub, "__class__"):
++            _safe_to(sub, "cpu")
++    # more aggressive: delete typical heavy attrs if present
++    for k in ["UNet","SRNet","Enhancer","FlowNet","OpticalFlow",
++              "FeatureExtractor","Refiner","TextEncoder","KVCache",
++              "KernelUp","PriorNet","AuxNet","dit"]:
++        if k in keep: 
++            continue
++        if hasattr(pipe, k):
++            with suppress(Exception):
++                delattr(pipe, k)
++    gc.collect()
++    with suppress(Exception):
++        torch.cuda.empty_cache()
++
++def _pick_secondary_decode_device(primary_device: str = "cuda:0") -> str | None:
++    if not torch.cuda.is_available():
++        return None
++    try:
++        n = torch.cuda.device_count()
++    except Exception:
++        n = 1
++    if n >= 2 and primary_device != "cuda:1":
++        return "cuda:1"
++    return None
++
++def _is_oom_error(e: BaseException) -> bool:
++    msg = str(e).lower()
++    kw = ["out of memory","allocation on device","cuda error: out of memory",
++          "cublas status alloc failed","c10::error"]
++    return any(k in msg for k in kw)
++
++def _move_vae(pipe, device: str):
++    # Handle both new_decoder=True and legacy pipe.vae
++    if getattr(pipe, "new_decoder", False):
++        cls = getattr(pipe.VAE, "__class__", type("X",(object,),{})).__name__
++        if cls == "AutoencoderKLWan":
++            pipe.VAE.to(device)
++        elif cls == "WanVAE":
++            # custom helpers if available
++            with suppress(Exception):
++                return pipe.VAE.to_cuda() if "cuda" in device else pipe.VAE.to_cpu()
++            with suppress(Exception):
++                pipe.VAE.to(device)
++        else:
++            with suppress(Exception):
++                pipe.VAE.to(device)
++    else:
++        pipe.vae.to(device)
++# ===========================================================================
+@@
+ def prepare_input_tensor(path, scale: int = 4,fps=30,dtype=torch.bfloat16, device='cuda'):
+     if isinstance(path,torch.Tensor):
+         total,h0,w0,_ = path.shape
+         if total == 1:
+             print("got image,repeating to 25 frames")
+             path = path.repeat(25, 1, 1, 1) 
+             total=25
+         sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
+-        pil_list=tensor2pillist(path)
+-        idx = list(range(total)) + [total - 1] * 4
+-        F = largest_8n1_leq(len(idx))
+-        idx = idx[:F]
+-        frames = []
+-        pil_list = [pil_list[i] for i in idx]
+-        for i in idx:
+-            img = pil_list[i].convert('RGB')
++        pil_list = tensor2pillist(path)
++        idx = list(range(total)) + [total - 1] * 4
++        F = largest_8n1_leq(len(idx))
++        idx = idx[:F]
++        frames = []
++        pil_list = [pil_list[i] for i in idx]
++        for img in pil_list:                       # ← iterate sublist directly
++            img = img.convert('RGB')
+             img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
+             frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))
+         frames = torch.stack(frames, 0).permute(1,0,2,3).unsqueeze(0)  # 1 C F H W  
+         torch.cuda.empty_cache()
+         return frames, tH, tW, F, fps
+@@
+-        frames = []
+-        for p in paths:
+-            with Image.open(p).convert('RGB') as img:
+-                img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)   
+-            frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))             
++        frames = []
++        for p in paths:
++            with Image.open(p) as _im:             # ← fix context manager misuse
++                img = _im.convert('RGB')
++            img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
++            frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))
+         vid = torch.stack(frames, 0).permute(1,0,2,3).unsqueeze(0)             
+         fps = 30
+         return vid, tH, tW, F, fps
+@@
+ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,tiled=True,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda",save_vodeo_=False,):
+-    pipe.to('cuda')  #pipe.enable_vram_management(num_persistent_param_in_dit=None)
++    pipe.to('cuda')  #pipe.enable_vram_management(num_persistent_param_in_dit=None)
++    _vram = VRAMMeter(devices=("cuda:0","cuda:1"))
++    _vram.snap("start")
+@@
+-    frames = pipe(
++    frames = pipe(
+         prompt="", negative_prompt="", cfg_scale=cfg_scale, num_inference_steps=step, seed=seed, tiled=tiled,
+         LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+         topk_ratio=sparse_ratio*768*1280/(th*tw), 
+         kv_ratio=kv_ratio,
+         local_range=local_range, # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
+         color_fix = color_fix,
+     )
+-    pipe.dit.to('cpu')
++    pipe.dit.to('cpu')
+     torch.cuda.empty_cache()
+-    #torch.Size([1, 16, 20, 48, 80])
+-    tiler_kwargs = {"tiled": tiled, "tile_size": (60, 104), "tile_stride": (30, 52)}
+-    with torch.no_grad():
+-        try:
+-            frames = pipe.decode_video(frames, **tiler_kwargs)
+-        except:
+-            print("vae decode_video OOM.try split latent" )
+-            if pipe.new_decoder:
+-                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
+-                    pipe.VAE.to('cpu')
+-                else:
+-                    if pipe.VAE.__class__.__name__ == "WanVAE":
+-                        pipe.VAE.to_cpu()
+-                    else: pass
+-            else:
+-                pipe.vae.to('cpu')
+-            torch.cuda.empty_cache()  
+-            if pipe.new_decoder:
+-                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
+-                    pipe.VAE.to('cuda') 
+-                else:
+-                    if pipe.VAE.__class__.__name__ == "WanVAE":
+-                        pipe.VAE.to_cuda()
+-                    else: pass
+-            else:
+-                pipe.vae.to('cuda')
+-            total_frames = frames.shape[2]
+-            segment_size = (split_num-1) * 2 // 4 # 40
+-            decoded_frames_list = []
+-            for start_idx in range(0, total_frames, segment_size):
+-                end_idx = min(start_idx + segment_size, total_frames)
+-                frames_segment = frames[:, :, start_idx:end_idx, :, :]          
+-                decoded_segment = pipe.decode_video(frames_segment, **tiler_kwargs)
+-                decoded_frames_list.append(decoded_segment)
+-            frames = torch.cat(decoded_frames_list, dim=2)  
++    tiler_kwargs = {"tiled": tiled, "tile_size": (60, 104), "tile_stride": (30, 52)}
++    with torch.no_grad():
++        def _decode_on(device_for_decode: str, use_segment_fallback: bool = True):
++            # Move only VAE to target device; keep others offloaded
++            _move_vae(pipe, device_for_decode)
++            _vram.reset_peak(device_for_decode)
++            _vram.snap(f"decode_enter:{device_for_decode}")
++
++            amp_dtype = _amp_dtype()
++            try:
++                with _amp_cast(amp_dtype):
++                    out_full = pipe.decode_video(frames, **tiler_kwargs)
++                _vram.snap(f"decode_done_once:{device_for_decode}")
++                return out_full
++            except RuntimeError as e:
++                if not (_is_oom_error(e) and use_segment_fallback):
++                    raise
++                print(f"VAE decode OOM on {device_for_decode}. Falling back to segmented decoding...")
++                total_frames = frames.shape[2]
++                # keep your original heuristic, but CPU-dump each chunk to reduce VRAM peak
++                segment_size = max(1, (split_num - 1) * 2 // 4)
++                decoded_cpu = []
++                for start_idx in range(0, total_frames, segment_size):
++                    end_idx = min(start_idx + segment_size, total_frames)
++                    seg = frames[:, :, start_idx:end_idx, :, :]
++                    with _amp_cast(amp_dtype):
++                        dec_seg = pipe.decode_video(seg, **tiler_kwargs)
++                    dec_seg = dec_seg.to("cpu", non_blocking=True)  # ← dump to CPU immediately
++                    decoded_cpu.append(dec_seg)
++                    del seg, dec_seg
++                    with suppress(Exception):
++                        torch.cuda.empty_cache()
++                    _vram.snap(f"seg_post_cpu_dump:{device_for_decode}:{start_idx}-{end_idx}")
++                frames_cat = torch.cat(decoded_cpu, dim=2)     # cat on CPU
++                _vram.snap("cpu_cat_done")
++                return frames_cat
++
++        try:
++            # 1) Offload non-decode modules then try on primary device first
++            _offload_non_decode_modules(pipe, keep=("VAE","ColorCorrector"))
++            frames = _decode_on(device_for_decode=device, use_segment_fallback=False)
++        except RuntimeError as e0:
++            if not _is_oom_error(e0):
++                raise
++            # 2) Try secondary GPU (e.g., cuda:1); else segment on primary
++            dev1 = _pick_secondary_decode_device(primary_device=device)
++            if dev1 is None:
++                print("Decode OOM and no secondary GPU. Trying segmented decode on primary...")
++                _offload_non_decode_modules(pipe, keep=("VAE","ColorCorrector"))
++                frames = _decode_on(device_for_decode=device, use_segment_fallback=True)
++            else:
++                print(f"Decode OOM on {device}. Retrying on {dev1}...")
++                _offload_non_decode_modules(pipe, keep=("VAE","ColorCorrector"))
++                frames = _decode_on(device_for_decode=dev1, use_segment_fallback=True)
++                # bring back to primary for post-proc
++                frames = frames.to(device, non_blocking=True)
+@@
+-        try:
++        try:
+             if color_fix:
+                 if pad_first_frame:
+                     frames = dup_first_frame_1cthw_simple(frames)
+                     LQ=dup_first_frame_1cthw_simple(LQ)
+                 if pipe.new_decoder and LQ.shape[-1]!=frames.shape[-1]:
+                     scale_=int(frames.shape[-1]/LQ.shape[-1])
+                     LQ=upscale_lq_video_bilinear(LQ,scale_)
+                 frames = pipe.ColorCorrector(
+-                    frames.to(device=device),
++                    frames.to(device=device),
+                     LQ[:, :, :frames.shape[2], :, :],
+                     clip_range=(-1, 1),
+                     chunk_size=16,
+                     method=fix_method
+                 )
+                 if pad_first_frame:
+                     frames = frames[:, :, 1:, :, :] # remove first frame
+         except:
+             pass
+         print("Done.")
+-        pipe.vae.to('cpu')  
++        with suppress(Exception):
++            pipe.vae.to('cpu')
+@@
+     if save_vodeo_:
+         save_video(frames, os.path.join(folder_paths.get_output_directory(),f"FlashVSR_Full_seed{seed}.mp4"), fps=fps, quality=6)
++    _vram.snap("end")
++    _vram.to_csv()
+     return frames
