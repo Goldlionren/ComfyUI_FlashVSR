@@ -1,107 +1,103 @@
-# ComfyUI_FlashVSR
-[FlashVSR](https://github.com/OpenImagingLab/FlashVSR): Towards Real-Time Diffusion-Based Streaming Video Super-Resolution,this node ,you can use it in comfyUI
+# 🚀 ComfyUI FlashVSR (Goldlionren Edition)
 
-# Upadte
-* update to version v1.1 /更新适配1.1版本的新模型和代码,降低闪烁，提高保真度和稳定性
-* add full mode [lightx2v vae encoder](https://huggingface.co/lightx2v/Autoencoders/tree/main) support（only lightvaew2_1.pth,taew2_1.pth,lighttaew2_1.pth） and [Wan2.1-VAE-upscale2x](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x) support    
-* 新增lightx2v 加速vae decoder支持和Wan2.1-VAE-upscale2x 放大decoder支持，只是在full 模式下有效，light的加速模型目前只支持（lightvaew2_1.pth  #32.2M,taew2_1.pth,lighttaew2_1.pth） 三个文件 
-# Tips
-*  满足部分网友需要超分单张图片的奇怪要求,默认输出25帧1秒的视频，详见示例，Block-Sparse-Attention 目前不支持5090的sm120架构，需要改一下Block-Sparse-Attention的源码来支持； 
-*  同步tiny的专属long模式  
-*  新增切片视频路径加载节点，输入保存切片视频的路径，开启自动推理，即可推理完路径所有视频； 
-*  修复输入图像归一化处理错误导致无法复现官方的问题，分离decoder，新增关键点模型卸载和OOM处理，包括处理超长视频向量的OOM，同步官方local range的修改，新增小波模式下的加减帧处理（项目一作大佬提的）；
-*  local_range=7这个是会最清晰，local_range=11会比较稳定，color fix 推荐用小波（没重影）； 
-*  编译Block-Sparse-Attention  window的轮子 可以使用 [ smthemex 强制编译版](https://github.com/smthemex/Block-Sparse-Attention) 或者 [lihaoyun6 要联网](https://github.com/lihaoyun6/Block-Sparse-Attention) 两个fork来，不推荐用官方的  
-*  Block-Sparse-Attention 正确安装且能调用才是方法的完全体，当前的函数实现会更容易OOM,但是Block-Sparse-Attention轮子实在不好找，目前只有[CU128 toch2.7](https://github.com/lihaoyun6/ComfyUI-WanVideoWrapper)的，我提供的（[cu128，torch2.8，py311单体](https://pan.quark.cn/s/c9ba067c89bc)）或者自己编译  
-*  方法是基于现有prompt.pt训练的，新增tile 和 color fix 选项，tile关闭质量更高，需要VRam更高，corlor fix对于非模糊图片可以试试。修复图片索引数不足的错误。  
-*  Choice vae infer full mode ，encoder infer tiny mode 选择vae跑full模式 效果最好，tiny则是速度，数据集基于4倍训练，所以1 scale是不推荐的；  
-*  如果觉得项目有用，请给官方项目[FlashVSR](https://github.com/OpenImagingLab/FlashVSR) 打星； if you Like it ， star the official project [link](https://github.com/OpenImagingLab/FlashVSR)
+> Enhanced version of [smthemex/ComfyUI_FlashVSR](https://github.com/smthemex/ComfyUI_FlashVSR)  
+> by [Goldlionren](https://github.com/Goldlionren), featuring **dual-GPU CUDA support**, **multi-device safe memory logic**, and **v11 compatibility**.
 
-  
-1.Installation  
------
-  In the ./ComfyUI/custom_nodes directory, run the following:   
-```
-git clone https://github.com/smthemex/ComfyUI_FlashVSR
+---
 
-```
+## ✨ What's New (2025-11)
 
-2.requirements  
-----
+✅ **Dual-GPU CUDA decoding**  
+- Added logic for automatic fallback between `cuda:0` and `cuda:1`  
+- Prevented cross-device tensor mismatches  
+- Ensures stable decoding even when out of GPU memory  
 
-```
-pip install -r requirements.txt
-```
-要复现官方效果，必须安装Block-Sparse-Attention [torch2.8 cu2.8 py311 wheel ](https://pan.quark.cn/s/c9ba067c89bc) or [CU128 toch2.7](https://github.com/lihaoyun6/ComfyUI-WanVideoWrapper)
-```
-git clone https://github.com/mit-han-lab/Block-Sparse-Attention 
-# git clone https://github.com/smthemex/Block-Sparse-Attention # 无须梯子强制编译
-# git clone https://github.com/lihaoyun6/Block-Sparse-Attention # 须梯子
-cd Block-Sparse-Attention
-pip install packaging
-pip install ninja
-python setup.py install
+✅ **Improved TCDecoder memory logic**  
+- Safe cross-device memory reuse  
+- Adds CPU fallback for out-of-memory stacking  
+- Eliminates device mismatch crashes  
+
+✅ **v11-compatible infer scripts**  
+- Updated:  
+  - `infer_flashvsr_v11_full.py`  
+  - `infer_flashvsr_v11_tiny.py`  
+- Based on upstream `v11` structure but retains Goldlionren’s multi-GPU logic  
+
+✅ **Clean upstream sync (Nov 2025)**  
+- Integrated the latest changes from `smthemex/main`  
+- Clean rebase and code merge with conflict resolution  
+
+---
+
+## 🔧 Installation
+
+Clone the latest **dual-GPU** branch:
+
+```bash
+git clone -b cuda_dual_gpu_v1_1 --single-branch https://github.com/Goldlionren/ComfyUI_FlashVSR.git
 ```
 
-3.checkpoints 
-----
+For Intel XPU users (Arc / iGPU), use the `XPU_v1.0` branch:
 
-* 3.1.2 [FlashVSRv1.0](https://huggingface.co/JunhaoZhuang/FlashVSR/tree/main)   all checkpoints 所有模型，vae 用常规的wan2.1
-* 3.1.2 [FlashVSRv1.1](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1/tree/main) all checkpoints 所有模型，vae 用常规的wan2.1
-* 3.2 emb  [posi_prompt.pth](https://github.com/OpenImagingLab/FlashVSR/tree/main/examples/WanVSR/prompt_tensor)  4M而已
-* 3.3 [lightvaew2_1.pth](https://huggingface.co/lightx2v/Autoencoders/tree/main) and [diffusion_pytorch_model.safetensors](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x/tree/main/diffusers/Wan2.1_VAE_upscale2x_imageonly_real_v1)
-  
+```bash
+git clone -b XPU_v1.0 --single-branch https://github.com/Goldlionren/ComfyUI_FlashVSR.git
 ```
-├── ComfyUI/models/FlashVSR
-|     ├── LQ_proj_in.ckpt # v1.1 or v1.0
-|     ├── TCDecoder.ckpt
-|     ├── diffusion_pytorch_model_streaming_dmd.safetensors #v1.1 or v1.0
-|     ├── posi_prompt.pth
-├── ComfyUI/models/vae
-|        ├──Wan2.1_VAE.pth
-|        ├──lightvaew2_1.pth  #32.2M  or taew2_1.pth,lighttaew2_1.pth
-|        ├──Wan2.1_VAE_upscale2x_imageonly_real_v1_diff.safetensors  # rename from diffusion_pytorch_model.safetensors
-```
-  
 
-# Example
-* upscale2x and ligth lightvaew2_1.pth
-![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example_decoder.png)
-* single image VSR 
-![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example_s.png)
-* full old node 
-![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example18.png)
-* tiny new
-![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example1022.png)
-* video files loop
-![](https://github.com/smthemex/ComfyUI_FlashVSR/blob/main/example_workflows/example.png)
+Then place the folder under your ComfyUI `custom_nodes` directory:
+```
+ComfyUI/custom_nodes/ComfyUI_FlashVSR
+```
 
-# Acknowledgements
-[DiffSynth Studio](https://github.com/modelscope/DiffSynth-Studio)  
-[Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)  
-[taehv](https://github.com/madebyollin/taehv)  
+---
 
-# Citation
-```
-@misc{zhuang2025flashvsrrealtimediffusionbasedstreaming,
-      title={FlashVSR: Towards Real-Time Diffusion-Based Streaming Video Super-Resolution}, 
-      author={Junhao Zhuang and Shi Guo and Xin Cai and Xiaohui Li and Yihao Liu and Chun Yuan and Tianfan Xue},
-      year={2025},
-      eprint={2510.12747},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2510.12747}, 
-}
+## ⚙️ Requirements
 
-```
-lightx2v
-```
-@misc{lightx2v,
- author = {LightX2V Contributors},
- title = {LightX2V: Light Video Generation Inference Framework},
- year = {2025},
- publisher = {GitHub},
- journal = {GitHub repository},
- howpublished = {\url{https://github.com/ModelTC/lightx2v}},
-}
-```
+- Python ≥ 3.10  
+- PyTorch ≥ 2.7.0 + CUDA 12.4  
+- Compatible with:
+  - NVIDIA RTX 40xx Series  
+  - Dual-GPU systems (tested on RTX 4080 SUPER + 4060 Ti)  
+  - Intel XPU (Arc A770 / A770M) via `XPU_v1.0` branch  
+
+---
+
+## 📂 Branch Summary
+
+| Branch | Description |
+|--------|--------------|
+| `main` | Upstream base (synced with smthemex) |
+| `XPU_v1.0` | Intel XPU build (Arc A770 / A770M) |
+| `cuda_dual_gpu_v1_1` | NVIDIA dual-GPU build (v11 integration, stable) |
+
+---
+
+## 🧠 Technical Notes
+
+- `TCDecoder.py` now includes robust device safety:
+  - Automatically reinitializes tensors when device mismatch detected  
+  - Supports CPU fallback when GPU memory exhausted  
+  - Ensures consistent decode state across re-runs  
+
+- `infer_flashvsr_full.py` / `infer_flashvsr_tiny.py` now:
+  - Detect GPU availability dynamically  
+  - Retry decode on secondary device  
+  - Integrate ComfyUI prompt parameters for flexible inference  
+
+---
+
+## 🇨🇳 中文说明
+
+本分支为在 ComfyUI 上运行 FlashVSR 的 **增强版**，主要改进包括：
+
+- **双显卡自动分担解码任务**（CUDA 版本）  
+- **显存不足自动回退机制**  
+- **跨设备安全内存管理（TCDecoder 修复）**  
+- **兼容 FlashVSR v11 的新版推理脚本**  
+- 已同步原作者仓库 2025 年 11 月更新内容  
+
+---
+
+## 🧩 Maintainer
+
+**Goldlionren**  
+📦 Repo: [https://github.com/Goldlionren/ComfyUI_FlashVSR](https://github.com/Goldlionren/ComfyUI_FlashVSR)
